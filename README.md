@@ -23,7 +23,7 @@ browser-engine experiment written in Rust.
 - [ ] JS Support
 - [ ] HTML5 input elements (forms, buttons)
 - [ ] DevTools
-- [ ] Keyboard shortcuts (Ctrl+T, Ctrl+W, Ctrl+L, ...)
+- [ ] Keyboard shortcuts (Ctrl+T, Ctrl+W, Ctrl+L, ...) (Partitionally done)
 - [ ] Update checker
 
 ## Download
