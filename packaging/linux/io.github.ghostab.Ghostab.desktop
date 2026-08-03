@@ -3,6 +3,7 @@ Type=Application
 Name=Ghostab
 Comment=Tiny experimental browser engine
 Exec=ghostab
+Icon=ghostab
 Terminal=false
 Categories=Network;WebBrowser;Development;
 Keywords=browser;engine;html;rust;

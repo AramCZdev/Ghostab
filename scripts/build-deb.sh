@@ -31,11 +31,14 @@ mkdir -p "$DIST_DIR"
 cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml"
 
 install -Dm755 "$ROOT_DIR/target/release/ghostab" "$PACKAGE_ROOT/usr/bin/ghostab"
+install -Dm644 "$ROOT_DIR/Ghostab.png" "$PACKAGE_ROOT/usr/share/icons/hicolor/256x256/apps/ghostab.png"
 install -Dm644 "$ROOT_DIR/packaging/linux/io.github.ghostab.Ghostab.desktop" \
     "$PACKAGE_ROOT/usr/share/applications/io.github.ghostab.Ghostab.desktop"
 install -Dm644 "$ROOT_DIR/README.md" "$PACKAGE_ROOT/usr/share/doc/$PACKAGE_NAME/README.md"
 install -Dm644 "$ROOT_DIR/LICENSE" "$PACKAGE_ROOT/usr/share/doc/$PACKAGE_NAME/copyright"
-install -Dm644 "$ROOT_DIR/examples/hello.html" "$PACKAGE_ROOT/usr/share/doc/$PACKAGE_NAME/examples/hello.html"
+for file in "$ROOT_DIR"/examples/*; do
+    install -Dm644 "$file" "$PACKAGE_ROOT/usr/share/doc/$PACKAGE_NAME/examples/$(basename "$file")"
+done
 
 sed \
     -e "s/^Version: .*/Version: $VERSION/" \
