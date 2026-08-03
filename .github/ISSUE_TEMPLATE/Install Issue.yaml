@@ -1,0 +1,66 @@
+name: Install Issue
+description: Report problems installing Ghostab
+title: "[Install Issue]: "
+labels: ["install issue"]
+
+body:
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux Debian
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating System Version
+      placeholder: "Example: Linux Mint 22.3, Ubuntu 24.04 LTS"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Installation Problem
+      description: Describe what happens when installing the game.
+      placeholder: "Example: Installation fails, app does not appear, permission error..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1. Download...
+        2. Open installer/package...
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Error Message or Logs
+      description: Paste any error messages here.
+      render: text
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or Videos
+      description: Add screenshots or recordings if they help explain the issue.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I downloaded Ghostab from an official source (aramczdev.gtihub.io/ghostab or Github Releases).
+        - label: I confirmed my device supports Ghostab.
+        - label: I checked existing issues and confirmed this installation issue has not already been reported.
+    validations:
+      required: true
