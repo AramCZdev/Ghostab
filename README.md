@@ -32,7 +32,7 @@ browser-engine experiment written in Rust.
 
 #### Debian
 
-1. Downlod the `.deb` package from releases or from (the official site)[https://aramczdev.github.io/ghostab]
+1. Downlod the `.deb` package from releases or from [the official site](https://aramczdev.github.io/ghostab)
 2. Open your terminal and write
 ```bash
 sudo apt install (path to your .deb)
