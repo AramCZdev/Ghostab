@@ -1,0 +1,9 @@
+[package]
+name = "ghostab"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "A tiny experimental browser engine written in Rust."
+
+[dependencies]
+image = { version = "0.24.9", default-features = false, features = ["bmp", "gif", "jpeg", "png"] }

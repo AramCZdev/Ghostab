@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Ghostab
+Comment=Tiny experimental browser engine
+Exec=ghostab
+Terminal=false
+Categories=Network;WebBrowser;Development;
+Keywords=browser;engine;html;rust;

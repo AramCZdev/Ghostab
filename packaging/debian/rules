@@ -1,0 +1,15 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release
+
+override_dh_auto_install:
+	mkdir -p debian/ghostab/usr/bin
+	cp target/release/ghostab debian/ghostab/usr/bin/
+	chmod 755 debian/ghostab/usr/bin/ghostab
+
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym
