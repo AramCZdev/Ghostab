@@ -1,3 +1,4 @@
+#![allow(unsafe_op_in_unsafe_fn)]
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::CString;
@@ -405,7 +406,6 @@ impl BrowserApp {
             hover_shield: false,
             settings: Settings::default(),
         };
-        apply_settings(&app.settings);
         app.relayout();
         app.tabs.push(app.snapshot());
         app.address_cursor = app.address_text.len();
@@ -1312,7 +1312,7 @@ unsafe fn run_x11_window(mut app: BrowserApp) {
                                     if app.address_focused {
                                         if let Some(selection) = app.copy_selection() {
                                             app.clipboard_text = selection;
-                                            app.owns_clipboard = true;
+                                            claim_clipboard(display, window, &mut app);
                                         }
                                     }
                                 }
@@ -1434,7 +1434,7 @@ unsafe fn run_x11_window(mut app: BrowserApp) {
                                 0x63 | 0x43 => {                     // c/C
                                     if let Some(selection) = app.copy_selection() {
                                         app.clipboard_text = selection;
-                                        app.owns_clipboard = true;
+                                        claim_clipboard(display, window, &mut app);
                                     }
                                 }
                                 0x76 | 0x56 => paste_clipboard(display, window, &mut app), // v/V
@@ -1862,7 +1862,10 @@ unsafe fn draw_browser(
 ) {
     DRAW_COUNT += 1;
     if DRAW_COUNT <= 5 {
-        eprintln!("ghostab-log: draw_browser #{} begin", DRAW_COUNT);
+        eprintln!(
+            "ghostab-log: draw_browser #{} begin",
+            unsafe { DRAW_COUNT }
+        );
     }
     let width = app.window_width as c_uint;
     let height = app.window_height as c_uint;
@@ -1875,8 +1878,8 @@ unsafe fn draw_browser(
         gc,
         18,
         TITLE_BAR_HEIGHT as c_int + 18,
-        (app.window_width - 36) as c_uint,
-        (app.window_height - TITLE_BAR_HEIGHT - STATUS_BAR_HEIGHT - 36) as c_uint,
+        (app.window_width.saturating_sub(36)) as c_uint,
+        (app.window_height.saturating_sub(TITLE_BAR_HEIGHT + STATUS_BAR_HEIGHT + 36)) as c_uint,
     );
     set_fg(display, gc, pal(COLOR_PAGE_BORDER));
     XDrawRectangle(
@@ -1885,8 +1888,8 @@ unsafe fn draw_browser(
         gc,
         18,
         TITLE_BAR_HEIGHT as c_int + 18,
-        (app.window_width - 36) as c_uint,
-        (app.window_height - TITLE_BAR_HEIGHT - STATUS_BAR_HEIGHT - 36) as c_uint,
+        (app.window_width.saturating_sub(36)) as c_uint,
+        (app.window_height.saturating_sub(TITLE_BAR_HEIGHT + STATUS_BAR_HEIGHT + 36)) as c_uint,
     );
     draw_title_bar(display, window, gc, font, app);
     draw_menu_bar(display, window, gc, font, app);
@@ -1894,7 +1897,10 @@ unsafe fn draw_browser(
         x: 0,
         y: TITLE_BAR_HEIGHT as i16,
         width: app.window_width.min(u16::MAX as usize) as u16,
-        height: (app.window_height - TITLE_BAR_HEIGHT - STATUS_BAR_HEIGHT).min(u16::MAX as usize) as u16,
+        height: app
+            .window_height
+            .saturating_sub(TITLE_BAR_HEIGHT + STATUS_BAR_HEIGHT)
+            .min(u16::MAX as usize) as u16,
     };
     XSetClipRectangles(display, gc, 0, 0, &clip, 1, 0);
     XftDrawSetClipRectangles(XFT_DRAW, 0, 0, &clip, 1);
@@ -2103,7 +2109,7 @@ unsafe fn draw_nav_button(
     enabled: bool,
     button: NavButton,
 ) {
-    let hovered = app.hover_button == Some(button);
+    let hovered = enabled && app.hover_button == Some(button);
     let fill = if !enabled {
         pal(COLOR_ADDRESS_BG)
     } else if hovered {
@@ -2729,7 +2735,15 @@ unsafe fn draw_scaled_image(
 
     let data = (*image).data as *mut u8;
     let bpp = (*image).bits_per_pixel;
-    let bytes_per_pixel = if bpp >= 32 { 4 } else { 3 };
+    let bytes_per_pixel = if bpp >= 32 {
+        4
+    } else if bpp >= 24 {
+        3
+    } else if bpp >= 16 {
+        2
+    } else {
+        1
+    };
     let stride = if (*image).bytes_per_line > 0 {
         (*image).bytes_per_line as usize
     } else {
@@ -2873,18 +2887,30 @@ unsafe fn visible_address(
     if text.is_empty() || text_width(font, text) <= max_width {
         return (text.clone(), 0);
     }
-    let mut start = app.address_cursor;
+    let cursor = app.address_cursor.min(text.len());
+    let mut start = cursor;
     loop {
         let previous = prev_char_index(text, start);
         if previous == 0 {
             break;
         }
-        if text_width(font, &text[previous..]) > max_width {
+        if text_width(font, &text[previous..cursor]) > max_width {
             break;
         }
         start = previous;
     }
-    (text[start..].to_string(), start)
+    let mut end = cursor;
+    loop {
+        let next = next_char_index(text, end);
+        if next > text.len() {
+            break;
+        }
+        if text_width(font, &text[start..next]) > max_width {
+            break;
+        }
+        end = next;
+    }
+    (text[start..end].to_string(), start)
 }
 
 unsafe fn cursor_for_click(app: &BrowserApp, font: *mut XftFont, click_x: c_int) -> usize {
@@ -2942,7 +2968,7 @@ unsafe fn ft_init_for_font(font: *mut XftFont) -> bool {
     let mut px: f64 = 13.0;
     FcPatternGetDouble((*font).pattern, b"pixelsize\0".as_ptr(), 0, &mut px);
 
-    if FT_LIB.is_null() && FT_Init_FreeType(&mut FT_LIB) != 0 {
+    if FT_LIB.is_null() && FT_Init_FreeType(ptr::addr_of_mut!(FT_LIB)) != 0 {
         return false;
     }
     let mut face: *mut FT_FaceRec = ptr::null_mut();
@@ -3029,7 +3055,7 @@ unsafe fn draw_about_content(display: *mut Display, window: c_ulong, gc: *mut GC
     set_fg(display, gc, pal(COLOR_BODY_TEXT));
     if tab == 0 {
         draw_string(display, window, gc, 28, 66, "Ghostab");
-        draw_string(display, window, gc, 28, 94, "Engine: Ghost Engine Alpha 1.0");
+        draw_string(display, window, gc, 28, 94, "Engine: Ghost Engine Alpha 1.1.0");
         draw_string(
             display,
             window,
@@ -3838,13 +3864,23 @@ unsafe fn load_system_font(display: *mut Display) -> *mut XftFont {
     ptr::null_mut()
 }
 
-unsafe fn paste_clipboard(_display: *mut Display, _window: c_ulong, app: &mut BrowserApp) {
-    if app.owns_clipboard {
-        if !app.clipboard_text.is_empty() {
-            let text = app.clipboard_text.clone();
-            app.insert_text(&text);
-        }
+unsafe fn claim_clipboard(display: *mut Display, window: c_ulong, app: &mut BrowserApp) {
+    app.owns_clipboard = true;
+    XSetSelectionOwner(display, window, XA_CLIPBOARD, CURRENT_TIME);
+    XFlush(display);
+}
+
+unsafe fn paste_clipboard(display: *mut Display, window: c_ulong, app: &mut BrowserApp) {
+    if app.owns_clipboard && !app.clipboard_text.is_empty() {
+        let text = app.clipboard_text.clone();
+        app.insert_text(&text);
+        return;
     }
+    let property = intern_atom(display, "GHOSTAB_CLIPBOARD");
+    app.pending_paste = true;
+    app.paste_retry = false;
+    XConvertSelection(display, XA_CLIPBOARD, XA_UTF8_STRING, property, window, CURRENT_TIME);
+    XFlush(display);
 }
 
 unsafe fn handle_selection_notify(
@@ -4033,7 +4069,7 @@ unsafe fn read_key(mut key_event: XKeyEvent) -> (KeyInput, KeyMods, KeySym) {
 
     let input = match keysym {
         XK_ESCAPE => KeyInput::Escape,
-        XK_RETURN => KeyInput::Enter,
+        XK_RETURN | XK_KP_ENTER => KeyInput::Enter,
         XK_BACK_SPACE => KeyInput::Backspace,
         XK_DELETE => KeyInput::Delete,
         XK_PAGE_UP => KeyInput::PageUp,
@@ -4357,6 +4393,7 @@ const XA_TARGETS: Atom = 161;
 
 const XK_BACK_SPACE: KeySym = 0xFF08;
 const XK_RETURN: KeySym = 0xFF0D;
+const XK_KP_ENTER: KeySym = 0xFF8D;
 const XK_ESCAPE: KeySym = 0xFF1B;
 const XK_HOME: KeySym = 0xFF50;
 const XK_LEFT: KeySym = 0xFF51;
@@ -4382,7 +4419,7 @@ unsafe fn sync_link_cursor(display: *mut Display, window: c_ulong, hand_cursor: 
 }
 
 #[link(name = "X11")]
-extern "C" {
+unsafe extern "C" {
     fn XOpenDisplay(display_name: *const c_char) -> *mut Display;
     fn XDefaultScreen(display: *mut Display) -> c_int;
     fn XDefaultVisual(display: *mut Display, screen_number: c_int) -> *mut Visual;
@@ -4600,7 +4637,7 @@ extern "C" {
 }
 
 #[link(name = "Xft")]
-extern "C" {
+unsafe extern "C" {
     fn XftFontOpenName(display: *mut Display, screen: c_int, name: *const c_char) -> *mut XftFont;
     fn XftFontClose(display: *mut Display, font: *mut XftFont);
     fn XftDrawCreate(
@@ -4630,7 +4667,7 @@ extern "C" {
 }
 
 #[link(name = "fontconfig")]
-extern "C" {
+unsafe extern "C" {
     fn FcPatternGetString(
         pattern: *mut c_void,
         object: *const u8,
@@ -4646,7 +4683,7 @@ extern "C" {
 }
 
 #[link(name = "freetype")]
-extern "C" {
+unsafe extern "C" {
     fn FT_Init_FreeType(library: *mut *mut FT_LibraryRec) -> c_int;
     fn FT_New_Face(
         library: *mut FT_LibraryRec,
@@ -4828,7 +4865,7 @@ mod tests {
         let cfg_dir = dir.join("ghostab");
         let path = cfg_dir.join("config.txt");
         let _ = std::fs::create_dir_all(&cfg_dir);
-        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
         std::fs::write(
             &path,
             "light_mode = true\nsearch_engine = custom\nsearch_url = https://example.com/?q=%s\n",
@@ -4841,7 +4878,7 @@ mod tests {
         save_settings(&loaded);
         let reloaded = load_settings();
         assert_eq!(reloaded, loaded);
-        std::env::remove_var("XDG_CONFIG_HOME");
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5040,5 +5077,39 @@ mod tests {
         assert!(!point_in_shield(SHIELD_X + SHIELD_SIZE + 2, ADDRESS_Y + 4));
         assert!(!point_in_shield(SHIELD_X + 4, ADDRESS_Y - 2));
         assert_eq!(ADDRESS_BAR_X, SHIELD_X + SHIELD_SIZE + NAV_BUTTON_GAP);
+    }
+
+    #[test]
+    fn new_tab_does_not_reset_light_mode() {
+        let mut app = BrowserApp::new(load_page(None));
+        app.settings.light_mode = true;
+        apply_settings(&app.settings);
+        assert!(light_mode_enabled());
+        app.new_tab();
+        assert!(light_mode_enabled());
+        apply_settings(&Settings::default());
+    }
+
+    #[test]
+    fn visible_address_windows_around_the_caret() {
+        let mut app = BrowserApp::new(load_page(None));
+        app.address_text = "abcdefghijklmnopqrstuvwxyz0123456789".to_string();
+        app.address_cursor = 10;
+        let (shown, start) = unsafe { visible_address(&app, ptr::null_mut(), 140) };
+        let end = start + shown.len();
+        assert!(start <= app.address_cursor && app.address_cursor <= end);
+        assert_eq!(app.address_text[start..end], shown);
+        assert!(shown.len() < app.address_text.len());
+        assert!(shown.contains("defghij"));
+    }
+
+    #[test]
+    fn visible_address_keeps_whole_short_text() {
+        let mut app = BrowserApp::new(load_page(None));
+        app.address_text = "about:sample".to_string();
+        app.address_cursor = 12;
+        let (shown, start) = unsafe { visible_address(&app, ptr::null_mut(), 500) };
+        assert_eq!(shown, "about:sample");
+        assert_eq!(start, 0);
     }
 }

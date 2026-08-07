@@ -32,8 +32,8 @@ cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml"
 
 install -Dm755 "$ROOT_DIR/target/release/ghostab" "$PACKAGE_ROOT/usr/bin/ghostab"
 install -Dm644 "$ROOT_DIR/Ghostab.png" "$PACKAGE_ROOT/usr/share/icons/hicolor/256x256/apps/ghostab.png"
-install -Dm644 "$ROOT_DIR/packaging/linux/io.github.ghostab.Ghostab.desktop" \
-    "$PACKAGE_ROOT/usr/share/applications/io.github.ghostab.Ghostab.desktop"
+install -Dm644 "$ROOT_DIR/packaging/linux/io.github.aramcz.ghostab.desktop" \
+    "$PACKAGE_ROOT/usr/share/applications/io.github.aramcz.ghostab.desktop"
 install -Dm644 "$ROOT_DIR/README.md" "$PACKAGE_ROOT/usr/share/doc/$PACKAGE_NAME/README.md"
 install -Dm644 "$ROOT_DIR/LICENSE" "$PACKAGE_ROOT/usr/share/doc/$PACKAGE_NAME/copyright"
 for file in "$ROOT_DIR"/examples/*; do

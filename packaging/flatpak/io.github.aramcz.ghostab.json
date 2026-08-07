@@ -1,0 +1,44 @@
+{
+  "id": "io.github.aramcz.ghostab",
+  "runtime": "org.freedesktop.Platform",
+  "runtime-version": "25.08",
+  "sdk": "org.freedesktop.Sdk",
+  "sdk-extensions": [
+    "org.freedesktop.Sdk.Extension.rust-stable"
+  ],
+  "command": "ghostab",
+  "build-options": {
+    "append-path": "/usr/lib/sdk/rust-stable/bin",
+    "build-args": [
+      "--share=network"
+    ]
+  },
+  "finish-args": [
+    "--share=network",
+    "--socket=x11",
+    "--share=ipc"
+  ],
+  "modules": [
+    {
+      "name": "ghostab",
+      "buildsystem": "simple",
+      "build-commands": [
+        "cargo build --release",
+        "install -Dm755 target/release/ghostab /app/bin/ghostab",
+        "install -Dm644 Ghostab.png /app/share/icons/hicolor/256x256/apps/io.github.aramcz.ghostab.png",
+        "install -Dm644 packaging/linux/io.github.aramcz.ghostab.desktop /app/share/applications/io.github.aramcz.ghostab.desktop",
+        "sed -i 's/^Icon=.*/Icon=io.github.aramcz.ghostab/' /app/share/applications/io.github.aramcz.ghostab.desktop",
+        "install -Dm644 README.md /app/share/doc/ghostab/README.md",
+        "install -Dm644 LICENSE /app/share/licenses/ghostab/LICENSE",
+        "mkdir -p /app/share/doc/ghostab/examples && install -m644 examples/* /app/share/doc/ghostab/examples/"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "path": "../../dist/ghostab-flatpak-src.tar.gz",
+          "dest": "."
+        }
+      ]
+    }
+  ]
+}

@@ -15,6 +15,7 @@ packaging/debian.deb
 *.rpm
 *.tar.gz
 *.zip
+/.flatpak-builder/
 
 # Vendored binary system libraries (copied in for packaging)
 /vendor/lib/

@@ -30,7 +30,7 @@ browser-engine experiment written in Rust.
 
 ### Linux
 
-#### Debian
+#### Debian (recommended)
 
 1. Downlod the `.deb` package from releases or from [the official site](https://aramczdev.github.io/ghostab)
 2. Open your terminal and write
@@ -38,6 +38,16 @@ browser-engine experiment written in Rust.
 sudo apt install (path to your .deb)
 ```
 3. Run `ghostab` and Ghostab will open
+
+#### Flatpak
+
+1. Downlod the `.flatpak` package from releases or from [the official site](https://aramczdev.github.io/ghostab)
+2. Open your terminal and write
+```bash
+flatpak install (path to your file)
+```
+3. Run `flatpak run io.github.aramcz.ghostab` and Ghostab will open
+
 
 ### Windows
 
