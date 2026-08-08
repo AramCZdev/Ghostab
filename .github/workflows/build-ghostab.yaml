@@ -20,11 +20,17 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Debian packaging tools
+      
+      - name: Install Debian packaging tools and build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y dpkg dpkg-dev
+          sudo apt-get install -y \
+            dpkg \
+            dpkg-dev \
+            libx11-dev \
+            libxft-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev
 
       - name: Build Debian package
         run: ./scripts/build-deb.sh
