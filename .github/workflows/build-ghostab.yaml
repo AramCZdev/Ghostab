@@ -1,4 +1,4 @@
-name: Build Ghostab Release
+name: Build Ghostab
 
 on:
 release:
@@ -52,11 +52,11 @@ steps:
       chmod +x scripts/build-flatpak.sh
       ./scripts/build-flatpak.sh
 
-  - name: Show built files
+  - name: Show built packages
     run: |
-      ls -lh dist/
+      ls -lh dist/*.deb dist/*.flatpak
 
-  - name: Upload packages to GitHub Release
+  - name: Upload packages to release
     uses: softprops/action-gh-release@v2
     with:
       tag_name: ${{ github.event.release.tag_name }}
