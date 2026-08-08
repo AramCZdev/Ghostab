@@ -1,5 +1,5 @@
 Package: ghostab
-Version: 1.1.0-alpha
+Version: 1.1.1-alpha
 Section: web
 Priority: optional
 Architecture: amd64

@@ -8,7 +8,7 @@ body:
     id: version
     attributes:
       label: Version
-      placeholder: "Example: Alpha 1.1.0"
+      placeholder: "Example: Alpha 1.1.1"
 
   - type: dropdown
     id: platform

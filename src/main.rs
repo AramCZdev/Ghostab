@@ -3245,7 +3245,7 @@ unsafe fn draw_about_content(display: *mut Display, window: c_ulong, gc: *mut GC
     set_fg(display, gc, pal(COLOR_BODY_TEXT));
     if tab == 0 {
         draw_string(display, window, gc, 28, 66, "Ghostab");
-        draw_string(display, window, gc, 28, 94, "Engine: Ghost Engine Alpha 1.1.0");
+        draw_string(display, window, gc, 28, 94, "Engine: Ghost Engine Alpha 1.1.1");
         draw_string(
             display,
             window,
