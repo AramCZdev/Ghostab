@@ -1,9 +1,8 @@
 name: Build Ghostab Release
 
 on:
-push:
-tags:
-- 'v*'
+release:
+types: [published]
 workflow_dispatch:
 
 permissions:
@@ -11,14 +10,15 @@ contents: write
 
 jobs:
 build:
-name: Build packages
+name: Build release packages
 runs-on: ubuntu-latest
 
 ```
 steps:
-  - name: Checkout
+  - name: Checkout released tag
     uses: actions/checkout@v4
     with:
+      ref: ${{ github.event.release.tag_name }}
       fetch-depth: 0
 
   - name: Install Rust
@@ -34,7 +34,7 @@ steps:
       chmod +x scripts/build-deb.sh
       ./scripts/build-deb.sh
 
-  - name: Install Flatpak
+  - name: Install Flatpak tools
     run: |
       sudo apt-get update
       sudo apt-get install -y flatpak flatpak-builder
@@ -52,16 +52,16 @@ steps:
       chmod +x scripts/build-flatpak.sh
       ./scripts/build-flatpak.sh
 
-  - name: Show release files
+  - name: Show built files
     run: |
-      echo "Built packages:"
-      ls -lh dist/*.deb dist/*.flatpak
+      ls -lh dist/
 
-  - name: Create GitHub Release
+  - name: Upload packages to GitHub Release
     uses: softprops/action-gh-release@v2
     with:
-      generate_release_notes: true
+      tag_name: ${{ github.event.release.tag_name }}
       files: |
         dist/*.deb
         dist/*.flatpak
+      fail_on_unmatched_files: true
 ```
