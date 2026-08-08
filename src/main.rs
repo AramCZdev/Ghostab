@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::CString;
 use std::fs;
+use std::io::Cursor;
 use std::os::raw::{c_char, c_int, c_long, c_short, c_uint, c_ulong, c_void};
 use std::path::PathBuf;
 use std::process::Command;
@@ -47,6 +48,14 @@ const ADDRESS_Y: c_int = TAB_BAR_Y + TAB_BAR_HEIGHT + 4;
 const ADDRESS_HEIGHT: c_uint = 36;
 const TITLE_BAR_HEIGHT: usize = (ADDRESS_Y + ADDRESS_HEIGHT as c_int + 8) as usize;
 const MARGIN_Y: usize = TITLE_BAR_HEIGHT + 34;
+
+// Network and image-loading limits. These are safety rails: they prevent a
+// single page from exhausting memory or being used to reach internal hosts.
+const MAX_DOWNLOAD_BYTES: &str = "52428800"; // 50 MiB, enforced by curl --max-filesize
+const MAX_DOWNLOAD_TIME_SECS: &str = "20";
+const MAX_IMAGE_DIMENSION: u32 = 8192; // reject images wider/taller than this
+const MAX_IMAGE_PIXELS: u64 = 40_000_000; // reject images with more pixels than this
+const MAX_PAGE_IMAGES: usize = 64; // cap auto-loaded <img> per page
 
 const COLOR_PAGE: c_ulong = 0x15181C;
 const COLOR_PAGE_BORDER: c_ulong = 0x333A41;
@@ -509,7 +518,10 @@ impl BrowserApp {
     }
 
     fn open_link(&mut self, href: &str) {
-        if href.starts_with("mailto:") || href.starts_with("javascript:") || href.starts_with('#') {
+        // Only allow navigable web schemes. This blocks mailto:, javascript:,
+        // data:, file:, ftp:, tel: and anything else that could escape the
+        // browser context or reach local files.
+        if href.starts_with('#') || !is_safe_link_scheme(href) {
             return;
         }
         let target = resolve_src(&self.page.source, href);
@@ -576,13 +588,28 @@ impl BrowserApp {
     fn load_images(&mut self, document: &engine::Document) -> HashMap<String, engine::ImageSpec> {
         let mut srcs = Vec::new();
         collect_img_srcs(&document.root, &mut srcs);
+        // Bound how many images a single page may auto-load.
+        srcs.truncate(MAX_PAGE_IMAGES);
         let mut specs = HashMap::new();
+
+        // When a remote page references an image on localhost or a private
+        // address, do not fetch it. This blocks remote sites from probing
+        // internal hosts (SSRF). Local and built-in pages are trusted.
+        let remote_page = matches!(
+            connection_state(&self.page.source),
+            ConnectionState::Protected | ConnectionState::Unprotected
+        );
 
         for raw in srcs {
             if raw.is_empty() || specs.contains_key(&raw) {
                 continue;
             }
             let key = resolve_src(&self.page.source, &raw);
+
+            if remote_page && is_private_host(url_host(&key)) {
+                self.images.failed.insert(key.clone());
+                continue;
+            }
 
             let image = if let Some(image) = self.images.originals.get(&key) {
                 Some(image.clone())
@@ -795,13 +822,26 @@ fn load_page(target: Option<&str>) -> BrowserPage {
         None => BrowserPage {
             source: "ghostab:newpage".to_string(),
             html: NEWTAB_HTML.to_string(),
-            title: "Ghostab New Tab".to_string(),
+            title: "New Tab".to_string(),
         },
     }
 }
 
 fn is_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
+}
+
+/// True if `href` uses a scheme Ghostab may navigate to. Relative references
+/// (no colon) are always allowed; known web/internal schemes are allowed;
+/// everything else (mailto, javascript, data, file, ftp, tel, ...) is not.
+fn is_safe_link_scheme(href: &str) -> bool {
+    let Some((scheme, _)) = href.split_once(':') else {
+        return true;
+    };
+    matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "http" | "https" | "about" | "ghostab"
+    )
 }
 
 fn connection_state(source: &str) -> ConnectionState {
@@ -982,11 +1022,31 @@ fn extract_title(html: &str) -> String {
 }
 
 fn fetch_url(url: &str) -> BrowserPage {
+    // Refuse anything that is not http/https before it ever reaches curl.
+    if !is_url(url) {
+        return BrowserPage {
+            source: url.to_string(),
+            html: error_page(
+                "Could not load website",
+                "Only http:// and https:// URLs are supported.",
+            ),
+            title: "Could not load website".to_string(),
+        };
+    }
     let mut cmd = Command::new("curl");
     cmd.args([
         "--location",
         "--max-time",
-        "20",
+        MAX_DOWNLOAD_TIME_SECS,
+        // Cap response size so one page cannot exhaust memory.
+        "--max-filesize",
+        MAX_DOWNLOAD_BYTES,
+        // Allow only http/https, and refuse protocol changes on redirect
+        // (blocks redirects to file://, ftp://, gopher://, etc.).
+        "--proto",
+        "=http,https",
+        "--proto-redir",
+        "=http,https",
         "--silent",
         "--show-error",
         "-A",
@@ -1061,6 +1121,16 @@ fn load_decoded_image(key: &str) -> Result<DecodedImage, String> {
     } else {
         fs::read(key).map_err(|error| error.to_string())?
     };
+    // Check the header-declared dimensions before decoding so a crafted image
+    // cannot allocate a huge buffer (decompression bomb).
+    let (width, height) = image::io::Reader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .map_err(|error| error.to_string())?
+        .into_dimensions()
+        .map_err(|error| error.to_string())?;
+    if image_exceeds_limits(width, height) {
+        return Err(format!("image dimensions exceed limits ({width}x{height})"));
+    }
     let image = image::load_from_memory(&bytes).map_err(|error| error.to_string())?;
     let rgba = image.to_rgba8();
     let (width, height) = rgba.dimensions();
@@ -1071,9 +1141,129 @@ fn load_decoded_image(key: &str) -> Result<DecodedImage, String> {
     })
 }
 
+/// Returns true when an image is too large to decode safely. Both the raw
+/// dimensions and the total pixel count are bounded, and a zero dimension is
+/// rejected outright.
+fn image_exceeds_limits(width: u32, height: u32) -> bool {
+    width == 0
+        || height == 0
+        || width > MAX_IMAGE_DIMENSION
+        || height > MAX_IMAGE_DIMENSION
+        || (width as u64) * (height as u64) > MAX_IMAGE_PIXELS
+}
+
+/// Parses a dotted-quad IPv4 address. Leading zeros are rejected because some
+/// resolvers treat them as octal, which could let a literal bypass a blocklist.
+fn parse_ipv4(host: &str) -> Option<[u8; 4]> {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let mut octets = [0u8; 4];
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty()
+            || part.len() > 3
+            || !part.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        if part.len() > 1 && part.starts_with('0') {
+            return None;
+        }
+        let value: u16 = part.parse().ok()?;
+        if value > 255 {
+            return None;
+        }
+        octets[i] = value as u8;
+    }
+    Some(octets)
+}
+
+/// True when `host` is loopback, link-local, or a private-address literal.
+/// Accepts an optional `:port` suffix and bracketed/unbracketed IPv6.
+fn is_private_host(host: &str) -> bool {
+    let host = host.trim();
+    if host.is_empty() {
+        return false;
+    }
+    // Bracketed IPv6, e.g. "[::1]" or "[::1]:8080".
+    if let Some(inner) = host.strip_prefix('[') {
+        let inner = inner.split(']').next().unwrap_or(inner);
+        return is_private_ipv6(inner);
+    }
+    // Hostname or IPv4, possibly with a numeric :port suffix.
+    let bare = strip_port(host);
+    if bare.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Some(ip) = parse_ipv4(bare) {
+        let [a, b, _, _] = ip;
+        return a == 0
+            || a == 10
+            || a == 127
+            || (a == 172 && (16..=31).contains(&b))
+            || (a == 192 && b == 168)
+            || (a == 169 && b == 254)
+            || (a == 100 && (64..=127).contains(&b));
+    }
+    // Unbracketed IPv6 literal.
+    is_private_ipv6(bare)
+}
+
+fn is_private_ipv6(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    if lower == "::1" || lower == "0:0:0:0:0:0:0:1" {
+        return true;
+    }
+    lower.starts_with("fe80:")
+}
+
+/// Removes a trailing `:port` (digits) unless the host looks like IPv6.
+fn strip_port(host: &str) -> &str {
+    if host.contains("::") {
+        return host;
+    }
+    host.rsplit_once(':').map_or(host, |(head, port)| {
+        if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) {
+            head
+        } else {
+            host
+        }
+    })
+}
+
+/// Extracts the host portion of a URL (no port, no brackets around IPv6).
+fn url_host(url: &str) -> &str {
+    let rest = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url);
+    if rest.starts_with('[') {
+        let end = rest.find(']').map(|index| index + 1).unwrap_or(rest.len());
+        return &rest[..end];
+    }
+    rest.split(['/', ':']).next().unwrap_or("")
+}
+
 fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+    if !is_url(url) {
+        return Err("unsupported URL scheme (only http/https allowed)".to_string());
+    }
     let output = Command::new("curl")
-        .args(["--location", "--max-time", "20", "--silent", "--show-error", url])
+        .args([
+            "--location",
+            "--max-time",
+            MAX_DOWNLOAD_TIME_SECS,
+            "--max-filesize",
+            MAX_DOWNLOAD_BYTES,
+            "--proto",
+            "=http,https",
+            "--proto-redir",
+            "=http,https",
+            "--silent",
+            "--show-error",
+            url,
+        ])
         .output()
         .map_err(|error| error.to_string())?;
     if output.status.success() {
@@ -5111,5 +5301,124 @@ mod tests {
         let (shown, start) = unsafe { visible_address(&app, ptr::null_mut(), 500) };
         assert_eq!(shown, "about:sample");
         assert_eq!(start, 0);
+    }
+
+    #[test]
+    fn foreign_schemes_are_rejected_in_links() {
+        for href in [
+            "mailto:someone@example.com",
+            "javascript:alert(1)",
+            "data:text/html,<b>hi</b>",
+            "file:///etc/passwd",
+            "ftp://example.com/x",
+            "tel:+123456",
+            "gopher://example.com",
+        ] {
+            assert!(!is_safe_link_scheme(href), "should reject {href}");
+        }
+        for href in [
+            "https://example.com/",
+            "HTTP://EXAMPLE.COM/x",
+            "about:sample",
+            "ghostab:newpage",
+            "/relative/path.html",
+            "page2.html",
+        ] {
+            assert!(is_safe_link_scheme(href), "should allow {href}");
+        }
+    }
+
+    #[test]
+    fn open_link_ignores_foreign_schemes() {
+        let mut app = BrowserApp::new(load_page(None));
+        for bad in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "mailto:test@example.com",
+            "data:text/plain,hi",
+            "ftp://example.com/x",
+        ] {
+            app.open_link(bad);
+            assert_eq!(app.page.source, "ghostab:newpage", "link not ignored: {bad}");
+        }
+        app.open_link("about:sample");
+        assert_eq!(app.page.source, "about:sample");
+    }
+
+    #[test]
+    fn fetch_rejects_unsupported_schemes_without_network() {
+        assert!(fetch_bytes("file:///etc/passwd").is_err());
+        assert!(fetch_bytes("ftp://example.com/x").is_err());
+        assert!(fetch_bytes("data:text/plain,hi").is_err());
+        assert!(fetch_bytes("gopher://example.com").is_err());
+        let page = fetch_url("file:///etc/passwd");
+        assert_eq!(page.title, "Could not load website");
+        assert!(page.html.contains("http:// and https://"));
+    }
+
+    #[test]
+    fn private_hosts_are_detected() {
+        for host in [
+            "localhost",
+            "localhost:8080",
+            "127.0.0.1",
+            "127.0.0.1:9000",
+            "0.0.0.0",
+            "10.0.0.1",
+            "10.255.255.255",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "100.127.255.255",
+            "::1",
+            "[::1]",
+            "[::1]:8080",
+            "fe80::1",
+        ] {
+            assert!(is_private_host(host), "expected private: {host}");
+        }
+        for host in [
+            "example.com",
+            "8.8.8.8",
+            "172.32.0.1",
+            "192.169.1.1",
+            "169.253.1.1",
+            "100.63.0.1",
+            "100.128.0.1",
+            "2001:4860:4860::8888",
+        ] {
+            assert!(!is_private_host(host), "expected public: {host}");
+        }
+    }
+
+    #[test]
+    fn url_host_extracts_host_without_port() {
+        assert_eq!(url_host("https://example.com/path"), "example.com");
+        assert_eq!(url_host("http://localhost:8090/x.png"), "localhost");
+        assert_eq!(url_host("http://127.0.0.1:9000/"), "127.0.0.1");
+        assert_eq!(url_host("http://[::1]:8080/"), "[::1]");
+    }
+
+    #[test]
+    fn image_pixel_limits_are_enforced() {
+        assert!(!image_exceeds_limits(100, 100));
+        assert!(!image_exceeds_limits(5000, 5000));
+        assert!(image_exceeds_limits(0, 100));
+        assert!(image_exceeds_limits(9000, 100));
+        assert!(image_exceeds_limits(8193, 100));
+        assert!(image_exceeds_limits(10000, 10000));
+        assert!(image_exceeds_limits(1, 50_000_000));
+    }
+
+    #[test]
+    fn remote_page_skips_private_image_hosts() {
+        let mut app = BrowserApp::new(load_page(None));
+        app.page.source = "https://example.com/page".to_string();
+        app.page.html =
+            "<html><body><img src=\"http://localhost:8090/x.png\"></body></html>".to_string();
+        app.relayout();
+        assert!(app.images.failed.contains("http://localhost:8090/x.png"));
     }
 }
