@@ -19,7 +19,6 @@ steps:
     uses: actions/checkout@v4
     with:
       ref: ${{ github.event.release.tag_name }}
-      fetch-depth: 0
 
   - name: Install Rust
     uses: dtolnay/rust-toolchain@stable
@@ -30,31 +29,20 @@ steps:
       sudo apt-get install -y dpkg dpkg-dev
 
   - name: Build Debian package
-    run: |
-      chmod +x scripts/build-deb.sh
-      ./scripts/build-deb.sh
+    run: ./scripts/build-deb.sh
 
   - name: Install Flatpak tools
     run: |
-      sudo apt-get update
       sudo apt-get install -y flatpak flatpak-builder
-
       sudo flatpak remote-add --if-not-exists \
         flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-
       sudo flatpak install -y flathub \
         org.freedesktop.Platform//25.08 \
         org.freedesktop.Sdk//25.08 \
         org.freedesktop.Sdk.Extension.rust-stable//25.08
 
   - name: Build Flatpak
-    run: |
-      chmod +x scripts/build-flatpak.sh
-      ./scripts/build-flatpak.sh
-
-  - name: Show built packages
-    run: |
-      ls -lh dist/*.deb dist/*.flatpak
+    run: ./scripts/build-flatpak.sh
 
   - name: Upload packages to release
     uses: softprops/action-gh-release@v2
