@@ -12,19 +12,26 @@ jobs:
   build:
     name: Build release packages
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout released tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || github.ref }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Debian packaging tools
+      - name: Install Debian packaging tools and build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y dpkg dpkg-dev
+          sudo apt-get install -y \
+            dpkg \
+            dpkg-dev \
+            libx11-dev \
+            libxft-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev
 
       - name: Build Debian package
         run: ./scripts/build-deb.sh
@@ -42,7 +49,18 @@ jobs:
       - name: Build Flatpak
         run: ./scripts/build-flatpak.sh
 
+      - name: Upload packages as artifacts
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghostab-packages
+          path: |
+            dist/*.deb
+            dist/*.flatpak
+          if-no-files-found: error
+
       - name: Upload packages to release
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.release.tag_name }}
