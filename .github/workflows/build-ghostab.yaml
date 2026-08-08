@@ -1,55 +1,52 @@
 name: Build Ghostab
 
 on:
-release:
-types: [published]
-workflow_dispatch:
+  release:
+    types: [published]
+  workflow_dispatch:
 
 permissions:
-contents: write
+  contents: write
 
 jobs:
-build:
-name: Build release packages
-runs-on: ubuntu-latest
+  build:
+    name: Build release packages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout released tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
 
-```
-steps:
-  - name: Checkout released tag
-    uses: actions/checkout@v4
-    with:
-      ref: ${{ github.event.release.tag_name }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
-  - name: Install Rust
-    uses: dtolnay/rust-toolchain@stable
+      - name: Install Debian packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg dpkg-dev
 
-  - name: Install Debian packaging tools
-    run: |
-      sudo apt-get update
-      sudo apt-get install -y dpkg dpkg-dev
+      - name: Build Debian package
+        run: ./scripts/build-deb.sh
 
-  - name: Build Debian package
-    run: ./scripts/build-deb.sh
+      - name: Install Flatpak tools
+        run: |
+          sudo apt-get install -y flatpak flatpak-builder
+          sudo flatpak remote-add --if-not-exists \
+            flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install -y flathub \
+            org.freedesktop.Platform//25.08 \
+            org.freedesktop.Sdk//25.08 \
+            org.freedesktop.Sdk.Extension.rust-stable//25.08
 
-  - name: Install Flatpak tools
-    run: |
-      sudo apt-get install -y flatpak flatpak-builder
-      sudo flatpak remote-add --if-not-exists \
-        flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-      sudo flatpak install -y flathub \
-        org.freedesktop.Platform//25.08 \
-        org.freedesktop.Sdk//25.08 \
-        org.freedesktop.Sdk.Extension.rust-stable//25.08
+      - name: Build Flatpak
+        run: ./scripts/build-flatpak.sh
 
-  - name: Build Flatpak
-    run: ./scripts/build-flatpak.sh
-
-  - name: Upload packages to release
-    uses: softprops/action-gh-release@v2
-    with:
-      tag_name: ${{ github.event.release.tag_name }}
-      files: |
-        dist/*.deb
-        dist/*.flatpak
-      fail_on_unmatched_files: true
-```
+      - name: Upload packages to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: |
+            dist/*.deb
+            dist/*.flatpak
+          fail_on_unmatched_files: true
