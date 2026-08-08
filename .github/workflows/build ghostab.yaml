@@ -1,0 +1,67 @@
+name: Build Ghostab Release
+
+on:
+push:
+tags:
+- 'v*'
+workflow_dispatch:
+
+permissions:
+contents: write
+
+jobs:
+build:
+name: Build packages
+runs-on: ubuntu-latest
+
+```
+steps:
+  - name: Checkout
+    uses: actions/checkout@v4
+    with:
+      fetch-depth: 0
+
+  - name: Install Rust
+    uses: dtolnay/rust-toolchain@stable
+
+  - name: Install Debian packaging tools
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y dpkg dpkg-dev
+
+  - name: Build Debian package
+    run: |
+      chmod +x scripts/build-deb.sh
+      ./scripts/build-deb.sh
+
+  - name: Install Flatpak
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y flatpak flatpak-builder
+
+      sudo flatpak remote-add --if-not-exists \
+        flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      sudo flatpak install -y flathub \
+        org.freedesktop.Platform//25.08 \
+        org.freedesktop.Sdk//25.08 \
+        org.freedesktop.Sdk.Extension.rust-stable//25.08
+
+  - name: Build Flatpak
+    run: |
+      chmod +x scripts/build-flatpak.sh
+      ./scripts/build-flatpak.sh
+
+  - name: Show release files
+    run: |
+      echo "Built packages:"
+      ls -lh dist/*.deb dist/*.flatpak
+
+  - name: Create GitHub Release
+    uses: softprops/action-gh-release@v2
+    with:
+      generate_release_notes: true
+      files: |
+        dist/*.deb
+        dist/*.flatpak
+```
