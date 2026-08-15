@@ -9,7 +9,7 @@
 
 ## Reporting a Vulnerability
 
-For Reporting a Vulnerability don't use Github Issues and instead contact me via [Email](mailto:aramcz@protonmail.com) or Github Vunerabilities
+For Reporting a Vulnerability don't use Github Issues and instead contact me via [Email](mailto:aramcz@protonmail.com) or Github Advisories
 
 ### Please include:
 
