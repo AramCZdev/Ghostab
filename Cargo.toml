@@ -6,4 +6,7 @@ license = "GPL-3.0"
 description = "A tiny experimental browser engine written in Rust."
 
 [dependencies]
+cosmic-text = "0.19"
 image = { version = "0.24.9", default-features = false, features = ["bmp", "gif", "jpeg", "png"] }
+softbuffer = "0.4.8"
+winit = "0.30"
