@@ -51,7 +51,9 @@ flatpak install (path to your file)
 
 ### Windows
 
-- Support for Ghostab is in development
+1. Download the .exe file
+2. Open it
+3. If you see a warning click View More and Run Anyway then Ghostab will open
 
 ### MacOS
 
