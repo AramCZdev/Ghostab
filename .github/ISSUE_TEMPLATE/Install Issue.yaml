@@ -9,7 +9,9 @@ body:
     attributes:
       label: Platform
       options:
-        - Linux Debian
+        - Windows
+        - Linux (Debian)
+        - Linux (Flatpak)
     validations:
       required: true
 
@@ -17,9 +19,7 @@ body:
     id: os
     attributes:
       label: Operating System Version
-      placeholder: "Example: Linux Mint 22.3, Ubuntu 24.04 LTS"
-    validations:
-      required: true
+      placeholder: "Example: Windows 11 24H2 Linux Mint 22.3, Ubuntu 24.04 LTS"
 
   - type: textarea
     id: problem
