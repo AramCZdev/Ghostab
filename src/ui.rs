@@ -414,7 +414,6 @@ enum Modal {
     Shield {
         state: ConnectionState,
         message: String,
-        asset: Option<DecodedImage>,
         opened: Instant,
     },
     About {
@@ -501,7 +500,7 @@ impl App {
         let Some((width, height)) = self.surface_size() else {
             return;
         };
-        let about_origin = self.modal_origin(520, 240);
+        let about_origin = self.modal_origin(ABOUT_W, ABOUT_H);
         let settings_origin = self.modal_origin(SETTINGS_W, SETTINGS_H);
         let shield_origin = self.modal_origin(SHIELD_W, SHIELD_H);
         let Some(surface) = &mut self.surface else {
@@ -539,17 +538,12 @@ impl App {
                     c.rect(0, 0, SETTINGS_W, SETTINGS_H);
                 });
             }
-            Some(Modal::Shield {
-                state,
-                message,
-                asset,
-                ..
-            }) => {
+            Some(Modal::Shield { state, message, .. }) => {
                 draw_browser(&self.app, &mut canvas);
                 canvas.dim(120);
                 let (mx, my) = shield_origin;
                 canvas.with_origin(mx, my, |c| {
-                    draw_shield_content(*state, message, asset.as_ref(), c);
+                    draw_shield_content(*state, message, c);
                     c.set_fg(pal(COLOR_PAGE_BORDER));
                     c.rect(0, 0, SHIELD_W, SHIELD_H);
                 });
@@ -566,15 +560,20 @@ impl App {
         );
         let mut modal_close_save: Option<Settings> = None;
         let mut modal_close = false;
-        let about_origin = self.modal_origin(520, 240);
+        let about_origin = self.modal_origin(ABOUT_W, ABOUT_H);
         let settings_origin = self.modal_origin(SETTINGS_W, SETTINGS_H);
         match &mut self.modal {
             Some(Modal::About { tab }) => {
                 let (mx, my) = about_origin;
-                if let Some(t) = about_tab_at(x - mx, y - my) {
+                let (lx, ly) = (x - mx, y - my);
+                if lx < 0 || ly < 0 || lx >= ABOUT_W || ly >= ABOUT_H {
+                    modal_close = true;
+                } else if let Some(t) = about_tab_at(lx, ly) {
                     if t != *tab {
                         *tab = t;
                     }
+                } else if about_close_at(lx, ly) {
+                    modal_close = true;
                 }
             }
             Some(Modal::Settings {
@@ -584,7 +583,9 @@ impl App {
             }) => {
                 let (mx, my) = settings_origin;
                 let (lx, ly) = (x - mx, y - my);
-                if settings_light_row_at(lx, ly) {
+                if lx < 0 || ly < 0 || lx >= SETTINGS_W || ly >= SETTINGS_H {
+                    modal_close = true;
+                } else if settings_light_row_at(lx, ly) {
                     working.light_mode = !working.light_mode;
                     apply_settings(working);
                 } else if let Some(engine) = settings_engine_at(lx, ly) {
@@ -718,16 +719,9 @@ impl App {
                 eprintln!("ghostab-log: click -> shield");
                 let state = connection_state(&app.page.source);
                 let message = shield_message(state);
-                let asset = if state == ConnectionState::BuiltIn {
-                    load_ghostab_image()
-                } else {
-                    let (disk, bytes) = shield_asset(state);
-                    load_asset_bytes(disk, bytes)
-                };
                 self.modal = Some(Modal::Shield {
                     state,
                     message,
-                    asset,
                     opened: Instant::now(),
                 });
                 sync_link_cursor(&self.window, false);
@@ -1138,15 +1132,6 @@ fn window_icon() -> Option<Icon> {
     load_ghostab_image().and_then(|image| {
         Icon::from_rgba(image.rgba, image.width, image.height).ok()
     })
-}
-
-fn shield_asset(state: ConnectionState) -> (&'static str, &'static [u8]) {
-    match state {
-        ConnectionState::Protected => ("assets/Protected.png", PROTECTED_PNG),
-        ConnectionState::Local => ("assets/Localfile.png", LOCALFILE_PNG),
-        ConnectionState::BuiltIn => ("Ghostab.png", ICON_PNG),
-        ConnectionState::Unprotected => ("assets/Unprotected.png", UNPROTECTED_PNG),
-    }
 }
 
 fn shield_message(state: ConnectionState) -> String {
@@ -1712,25 +1697,41 @@ fn cursor_for_click(app: &BrowserApp, click_x: c_int) -> usize {
     start + best
 }
 
+const ABOUT_W: c_int = 520;
+const ABOUT_H: c_int = 240;
+const ABOUT_CLOSE_X: c_int = ABOUT_W - 16 - SETTINGS_OK_W;
+const ABOUT_CLOSE_Y: c_int = ABOUT_H - 42;
+
 fn draw_about_content(tab: u8, canvas: &mut Canvas) {
     canvas.set_fg(pal(COLOR_PAGE));
-    canvas.fill_rect(0, 0, 520, 240);
+    canvas.fill_rect(0, 0, ABOUT_W, ABOUT_H);
     draw_about_tabs(tab, canvas);
     canvas.set_fg(pal(COLOR_BODY_TEXT));
     if tab == 0 {
-        canvas.text_baseline(28, 66, "Ghostab");
-        canvas.text_baseline(28, 94, "Engine: Ghost Engine Alpha 1.1.1");
-        canvas.text_baseline(28, 122, "A tiny experimental browser engine written in Rust.");
-        canvas.text_baseline(28, 150, "Networking: HTTP/HTTPS loading through curl.");
-        canvas.text_baseline(28, 178, "Rendering: simplified HTML text layout in a winit window.");
-        canvas.text_baseline(28, 206, "Privacy: clipboard is app-only and never touches the OS.");
+        canvas.text_baseline(28, 58, "Ghostab");
+        canvas.text_baseline(28, 82, "Engine: Ghost Engine 2.0.0-alpha");
+        canvas.text_baseline(28, 106, "A tiny experimental browser engine written in Rust.");
+        canvas.text_baseline(28, 130, "Networking: HTTP/HTTPS loading through curl.");
+        canvas.text_baseline(28, 154, "Rendering: simplified HTML text layout in a winit window.");
+        canvas.text_baseline(28, 178, "Privacy: clipboard is app-only and never touches the OS.");
     } else {
-        canvas.text_baseline(28, 66, "Credits");
-        canvas.text_baseline(28, 94, "Made by AramCZ");
-        canvas.text_baseline(28, 122, "Tools: Rust, C (curl), winit, softbuffer, cosmic-text,");
-        canvas.text_baseline(28, 150, "the image crate, dpkg, Bash.");
-        canvas.text_baseline(28, 178, "Built with some assistance from Opencode.");
+        canvas.text_baseline(28, 58, "Credits");
+        canvas.text_baseline(28, 82, "Made by AramCZ");
+        canvas.text_baseline(28, 106, "Tools: Rust, C (curl), winit, softbuffer, cosmic-text,");
+        canvas.text_baseline(28, 130, "the image crate, dpkg, Bash.");
+        canvas.text_baseline(28, 154, "Built with some assistance from Opencode.");
     }
+    canvas.set_fg(pal(COLOR_PAGE_BORDER));
+    canvas.line(16, ABOUT_H - 52, ABOUT_W - 16, ABOUT_H - 52);
+    draw_settings_button(
+        canvas,
+        ABOUT_CLOSE_X,
+        ABOUT_CLOSE_Y,
+        SETTINGS_OK_W,
+        SETTINGS_OK_H,
+        "Close",
+        false,
+    );
 }
 
 fn draw_about_tabs(active: u8, canvas: &mut Canvas) {
@@ -1768,6 +1769,11 @@ fn about_tab_at(x: c_int, y: c_int) -> Option<u8> {
     } else {
         None
     }
+}
+
+fn about_close_at(x: c_int, y: c_int) -> bool {
+    (ABOUT_CLOSE_X..ABOUT_CLOSE_X + SETTINGS_OK_W).contains(&x)
+        && (ABOUT_CLOSE_Y..ABOUT_CLOSE_Y + SETTINGS_OK_H).contains(&y)
 }
 
 fn draw_settings_content(
@@ -1845,7 +1851,7 @@ fn draw_settings_content(
         SETTINGS_OK_Y,
         SETTINGS_OK_W,
         SETTINGS_OK_H,
-        "Cancel",
+        "Close",
         false,
     );
 }
@@ -1901,12 +1907,10 @@ fn draw_settings_button(
     canvas.text_centered(x + (width - label_width) / 2, y, height, label);
 }
 
-fn draw_shield_content(
-    state: ConnectionState,
-    message: &str,
-    asset: Option<&DecodedImage>,
-    canvas: &mut Canvas,
-) {
+const SHIELD_CLOSE_X: c_int = SHIELD_W - 16 - SETTINGS_OK_W;
+const SHIELD_CLOSE_Y: c_int = SHIELD_H - 42;
+
+fn draw_shield_content(state: ConnectionState, message: &str, canvas: &mut Canvas) {
     canvas.set_fg(pal(COLOR_PAGE));
     canvas.fill_rect(0, 0, SHIELD_W, SHIELD_H);
     let headline = match state {
@@ -1922,23 +1926,19 @@ fn draw_shield_content(
     canvas.set_fg(pal(COLOR_PAGE_BORDER));
     canvas.line(16, 68, SHIELD_W - 16, 68);
 
-    if let Some(image) = asset {
-        canvas.image(
-            &image.rgba,
-            image.width,
-            image.height,
-            SHIELD_IMG_X,
-            SHIELD_IMG_Y,
-            SHIELD_IMG_SIZE as c_int,
-            SHIELD_IMG_SIZE as c_int,
-            Some(pal(COLOR_PAGE)),
-        );
-    }
-
     canvas.set_fg(pal(COLOR_BODY_TEXT));
     for (i, line) in wrap_text(message, 70).iter().enumerate() {
         canvas.text_baseline(28, SHIELD_TEXT_Y + i as c_int * SHIELD_LINE_STEP, line);
     }
+    draw_settings_button(
+        canvas,
+        SHIELD_CLOSE_X,
+        SHIELD_CLOSE_Y,
+        SETTINGS_OK_W,
+        SETTINGS_OK_H,
+        "Close",
+        false,
+    );
 }
 
 enum KeyInput {

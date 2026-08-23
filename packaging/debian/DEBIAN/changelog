@@ -1,3 +1,9 @@
+ghostab (2.0.0-alpha) unstable; urgency=medium
+
+  * New winit-based UI, app-only clipboard, text-only connection popups.
+
+ -- AramCZ <aramcz@protonmail.com>  Sun, 23 Aug 2026 00:00:00 +0000
+
 ghostab (0.1.0-1) unstable; urgency=medium
 
   * Initial release.

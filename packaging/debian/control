@@ -1,12 +1,12 @@
 Package: ghostab
-Version: 1.1.1-alpha
+Version: 2.0.0-alpha
 Section: web
 Priority: optional
 Architecture: amd64
 Maintainer: AramCZ <aramcz@protonmail.com>
 Depends: libx11-6, curl
-Description: Tiny experimental browser engine written in Rust
- Ghostab is an early browser-engine experiment. This first Debian build
- provides a graphical app powered by Ghost Engine. It can load local files
- or fetch HTTP/HTTPS pages with curl, parse a small HTML subset, create a
- DOM, lay out simple block text, and render into a Linux desktop window.
+Description: Graphical browser experiment powered by Ghost Engine
+ Ghostab is a small graphical browser built around an experimental
+ engine. It can open local HTML files or fetch pages over HTTP/HTTPS
+ using curl, render text and images in tabs, and show connection
+ security details for every site.

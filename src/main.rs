@@ -1,4 +1,5 @@
 #![allow(unsafe_op_in_unsafe_fn)]
+#![windows_subsystem = "windows"]
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -1303,10 +1304,6 @@ fn next_char_index(text: &str, index: usize) -> usize {
 }
 
 static ICON_PNG: &[u8] = include_bytes!("../Ghostab.png");
-static PROTECTED_PNG: &[u8] = include_bytes!("../assets/Protected.png");
-static LOCALFILE_PNG: &[u8] = include_bytes!("../assets/Localfile.png");
-static UNPROTECTED_PNG: &[u8] = include_bytes!("../assets/Unprotected.png");
-
 
 fn refresh_button_x(window_width: usize) -> c_int {
     window_width as c_int - NAV_BUTTON_SIZE - 16
@@ -1621,30 +1618,9 @@ fn settings_cancel_at(x: c_int, y: c_int) -> bool {
 }
 
 const SHIELD_W: c_int = 560;
-const SHIELD_H: c_int = 600;
-const SHIELD_IMG_X: c_int = 88;
-const SHIELD_IMG_Y: c_int = 84;
-const SHIELD_IMG_SIZE: u32 = 384;
-const SHIELD_TEXT_Y: c_int = 500;
+const SHIELD_H: c_int = 240;
+const SHIELD_TEXT_Y: c_int = 100;
 const SHIELD_LINE_STEP: c_int = 26;
-
-fn decode_image_bytes(bytes: &[u8]) -> Option<DecodedImage> {
-    let image = image::load_from_memory(bytes).ok()?;
-    let rgba = image.to_rgba8();
-    let (width, height) = rgba.dimensions();
-    Some(DecodedImage {
-        width,
-        height,
-        rgba: rgba.into_raw(),
-    })
-}
-
-fn load_asset_bytes(disk_path: &str, embedded: &[u8]) -> Option<DecodedImage> {
-    fs::read(disk_path)
-        .ok()
-        .and_then(|bytes| decode_image_bytes(&bytes))
-        .or_else(|| decode_image_bytes(embedded))
-}
 
 fn decode_ghostab_icon(bytes: &[u8]) -> Option<DecodedImage> {
     let image = image::load_from_memory(bytes).ok()?;
