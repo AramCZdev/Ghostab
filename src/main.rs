@@ -505,14 +505,36 @@ impl BrowserApp {
     }
 
     fn open_link(&mut self, href: &str) {
-        // Only allow navigable web schemes. This blocks mailto:, javascript:,
-        // data:, file:, ftp:, tel: and anything else that could escape the
-        // browser context or reach local files.
-        if href.starts_with('#') || !is_safe_link_scheme(href) {
+        if href.starts_with('#') {
+            return;
+        }
+        // mailto: links are handed to the desktop mail client instead of
+        // being treated as a navigation target.
+        if href.starts_with("mailto:") {
+            self.open_mailto(href);
             return;
         }
         let target = resolve_src(&self.page.source, href);
+        // Only allow navigable web schemes. This blocks javascript:, data:,
+        // file:, ftp:, tel: and anything else that could escape the browser
+        // context or reach local files — except that a local page may link to
+        // another local page, mirroring real browsers.
+        let local_to_local =
+            self.page.source.starts_with("file://") && target.starts_with("file://");
+        if !local_to_local && !is_safe_link_scheme(href) {
+            return;
+        }
         self.navigate_new(&target);
+    }
+
+    fn open_mailto(&mut self, href: &str) {
+        if !is_valid_mailto(href) {
+            return;
+        }
+        if let Err(error) = open_external(href) {
+            eprintln!("ghostab-log: could not open '{href}': {error}");
+            self.navigate_new("ghostab:mailto-failed");
+        }
     }
 
     fn navigate_new(&mut self, target: &str) {
@@ -765,6 +787,14 @@ fn load_page(target: Option<&str>) -> BrowserPage {
         Some("ghostab:linkdemo") => {
             examples_page("linkdemo.html", "ghostab:linkdemo", "Ghostab Link Demo")
         }
+        Some("ghostab:mailto-failed") => BrowserPage {
+            source: "ghostab:mailto-failed".to_string(),
+            html: error_page(
+                "Could not open mail client",
+                "Ghostab could not find or start a mail program on this system.",
+            ),
+            title: "Could not open mail client".to_string(),
+        },
         Some(target) if target.starts_with("ghostab:") => BrowserPage {
             source: target.to_string(),
             html: error_page(
@@ -793,6 +823,7 @@ fn load_page(target: Option<&str>) -> BrowserPage {
                 title: "Unknown page".to_string(),
             },
         },
+        Some(target) if target.starts_with("file://") => load_file_url(target),
         Some(target) if is_url(target) => fetch_url(target),
         Some(path) => match fs::read_to_string(path) {
             Ok(contents) => BrowserPage {
@@ -816,6 +847,102 @@ fn load_page(target: Option<&str>) -> BrowserPage {
 
 fn is_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
+}
+
+/// Converts a file:// URL into a local filesystem path. Accepts the empty
+/// authority form (file:///path) and "localhost"; any other host is rejected.
+/// Windows drive paths (file:///C:/...) lose their leading slash, and
+/// percent-encoded segments are decoded.
+fn file_path_from_url(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("file://")?;
+    let (authority, tail) = rest.split_once('/')?;
+    if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
+        return None;
+    }
+    let mut path = percent_decode(&format!("/{tail}"));
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        path.remove(0);
+    }
+    if path.is_empty() || path == "/" {
+        return None;
+    }
+    Some(path)
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            let high = (bytes[i + 1] as char).to_digit(16);
+            let low = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(high), Some(low)) = (high, low) {
+                out.push((high * 16 + low) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// mailto links are handed to the operating system, so refuse anything
+/// suspicious before it ever leaves the browser.
+fn is_valid_mailto(href: &str) -> bool {
+    match href.strip_prefix("mailto:") {
+        Some(rest) => !rest.is_empty() && !rest.chars().any(|c| c.is_control() || c.is_whitespace()),
+        None => false,
+    }
+}
+
+#[cfg_attr(test, allow(unused_variables))]
+fn open_external(url: &str) -> Result<(), String> {
+    #[cfg(test)]
+    return Ok(());
+    #[cfg(not(test))]
+    {
+        #[cfg(target_os = "windows")]
+        let program = "explorer";
+        #[cfg(target_os = "macos")]
+        let program = "open";
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let program = "xdg-open";
+        Command::new(program)
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn load_file_url(url: &str) -> BrowserPage {
+    let source = url.to_string();
+    let Some(path) = file_path_from_url(url) else {
+        return BrowserPage {
+            source,
+            html: error_page(
+                "Could not read file",
+                &format!("'{url}' is not a valid file URL."),
+            ),
+            title: "Could not read file".to_string(),
+        };
+    };
+    match fs::read_to_string(&path) {
+        Ok(contents) => BrowserPage {
+            title: extract_title(&contents),
+            source,
+            html: contents,
+        },
+        Err(error) => BrowserPage {
+            source,
+            html: error_page("Could not read file", &format!("{path}: {error}")),
+            title: "Could not read file".to_string(),
+        },
+    }
 }
 
 /// True if `href` uses a scheme Ghostab may navigate to. Relative references
@@ -956,6 +1083,7 @@ fn normalize_navigation_target(input: &str, settings: &Settings) -> String {
 
     if trimmed.is_empty()
         || is_url(trimmed)
+        || trimmed.starts_with("file://")
         || trimmed.starts_with("about:")
         || trimmed.starts_with("ghostab:")
         || fs::metadata(trimmed).is_ok()
@@ -1103,7 +1231,9 @@ fn collect_img_srcs(node: &engine::dom::Node, out: &mut Vec<String>) {
 }
 
 fn load_decoded_image(key: &str) -> Result<DecodedImage, String> {
-    let bytes = if is_url(key) {
+    let bytes = if let Some(path) = file_path_from_url(key) {
+        fs::read(path).map_err(|error| error.to_string())?
+    } else if is_url(key) {
         fetch_bytes(key)?
     } else {
         fs::read(key).map_err(|error| error.to_string())?
@@ -2041,6 +2171,93 @@ mod tests {
         assert_eq!(connection_state("ghostab:newpage"), ConnectionState::BuiltIn);
         assert_eq!(connection_state("ghostab:imagedemo"), ConnectionState::BuiltIn);
         assert_eq!(connection_state("about:blank"), ConnectionState::Local);
+        assert_eq!(
+            connection_state("file:///home/me/page.html"),
+            ConnectionState::Local
+        );
+    }
+
+    #[test]
+    fn file_urls_map_to_local_paths() {
+        assert_eq!(
+            file_path_from_url("file:///home/aramcz/hi.html").as_deref(),
+            Some("/home/aramcz/hi.html")
+        );
+        assert_eq!(
+            file_path_from_url("file://localhost/tmp/a.html").as_deref(),
+            Some("/tmp/a.html")
+        );
+        assert_eq!(
+            file_path_from_url("file:///C:/Users/me/hi.html").as_deref(),
+            Some("C:/Users/me/hi.html")
+        );
+        assert_eq!(
+            file_path_from_url("file:///dir/we%20ird%20name.html").as_deref(),
+            Some("/dir/we ird name.html")
+        );
+        assert_eq!(file_path_from_url("file://evil.com/x.html"), None);
+        assert_eq!(file_path_from_url("https://example.com/a.html"), None);
+    }
+
+    #[test]
+    fn normalize_navigation_target_keeps_file_urls() {
+        let settings = Settings::default();
+        assert_eq!(
+            normalize_navigation_target("file:///home/aramcz/hi.html", &settings),
+            "file:///home/aramcz/hi.html"
+        );
+    }
+
+    #[test]
+    fn load_page_reads_file_urls_and_reports_missing_files() {
+        let page = load_page(Some("file:///ghostab-definitely-missing.html"));
+        assert_eq!(page.title, "Could not read file");
+
+        let dir = std::env::temp_dir().join(format!("ghostab-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hi.html");
+        std::fs::write(&path, "<html><title>Hi from disk</title></html>").unwrap();
+        let page = load_page(Some(&format!("file://{}", path.display())));
+        assert_eq!(page.title, "Hi from disk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_pages_may_link_to_other_local_pages_only() {
+        let mut app = BrowserApp::new(load_page(Some("file:///dir/index.html")));
+        app.open_link("next.html");
+        assert_eq!(app.page.source, "file:///dir/next.html");
+
+        let mut web = BrowserApp::new(load_page(None));
+        web.page.source = "https://example.com/page.html".to_string();
+        web.open_link("file:///etc/passwd");
+        assert_eq!(web.page.source, "https://example.com/page.html");
+    }
+
+    #[test]
+    fn mailto_validation_rejects_malformed_links() {
+        assert!(is_valid_mailto("mailto:hi@example.com"));
+        assert!(is_valid_mailto("mailto:hi@example.com?subject=Hello"));
+        assert!(!is_valid_mailto("mailto:"));
+        assert!(!is_valid_mailto("mailto:a b@example.com"));
+        assert!(!is_valid_mailto("mailto:a\nb@example.com"));
+        assert!(!is_valid_mailto("http://example.com"));
+    }
+
+    #[test]
+    fn mailto_links_open_externally_without_navigating() {
+        let mut app = BrowserApp::new(load_page(None));
+        app.open_link("mailto:hi@example.com");
+        assert_eq!(app.page.source, "ghostab:newpage");
+
+        app.open_link("mailto:");
+        assert_eq!(app.page.source, "ghostab:newpage");
+    }
+
+    #[test]
+    fn mailto_failure_page_is_built_in() {
+        let page = load_page(Some("ghostab:mailto-failed"));
+        assert_eq!(page.title, "Could not open mail client");
     }
 
     #[test]
