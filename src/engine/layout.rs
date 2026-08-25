@@ -216,24 +216,28 @@ fn layout_inline_flow(
 
     for (text, href) in runs {
         for word in text.split_whitespace() {
-            let word_len = word.len();
+            let word_len = word.chars().count();
             if word_len > content_width {
-                flush_inline_line(&mut boxes, &mut line_words, cursor.y, indent);
-                cursor.y += 1;
-                line_len = 0;
+                if !line_words.is_empty() {
+                    flush_inline_line(&mut boxes, &mut line_words, cursor.y, indent);
+                    cursor.y += 1;
+                    line_len = 0;
+                }
+                let chars: Vec<char> = word.chars().collect();
                 let mut start = 0;
-                while start < word_len {
-                    let end = usize::min(start + content_width, word_len);
+                while start < chars.len() {
+                    let end = usize::min(start + content_width, chars.len());
+                    let fragment: String = chars[start..end].iter().collect();
                     boxes.push(LayoutBox {
                         rect: Rect {
                             x: indent,
                             y: cursor.y,
-                            width: end - start,
+                            width: fragment.len(),
                             height: 1,
                         },
-                        text: Some(word[start..end].to_string()),
-                        href: None,
-                        links: span_list(start, end, href.as_deref()),
+                        text: Some(fragment),
+                        href: href.clone(),
+                        links: span_list(0, end - start, href.as_deref()),
                         image: None,
                         rule: false,
                         children: Vec::new(),
@@ -285,7 +289,7 @@ fn flush_inline_line(
         offset += word.len();
         if let Some(href) = href {
             if let Some(last) = links.last_mut() {
-                if last.end == start && last.href == *href {
+                if last.end + 1 == start && last.href == *href {
                     last.end = offset;
                     continue;
                 }
@@ -404,23 +408,24 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 
     for word in text.split_whitespace() {
         // If the word itself is longer than the width, break it into chunks.
-        if word.len() > width {
+        if word.chars().count() > width {
             if !current.is_empty() {
                 lines.push(current);
                 current = String::new();
             }
 
+            let chars: Vec<char> = word.chars().collect();
             let mut start = 0;
-            while start < word.len() {
-                let end = usize::min(start + width, word.len());
-                lines.push(word[start..end].to_string());
+            while start < chars.len() {
+                let end = usize::min(start + width, chars.len());
+                lines.push(chars[start..end].iter().collect());
                 start = end;
             }
             continue;
         }
 
         let separator = usize::from(!current.is_empty());
-        if current.len() + separator + word.len() > width && !current.is_empty() {
+        if current.chars().count() + separator + word.chars().count() > width && !current.is_empty() {
             lines.push(current);
             current = String::new();
         }

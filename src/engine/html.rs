@@ -62,12 +62,14 @@ impl<'a> Parser<'a> {
         self.consume_char();
         let tag_name = self.consume_tag_name();
         let attributes = self.parse_attributes();
-        let self_closing = self.next_char() == '/';
+        let self_closing = !self.eof() && self.next_char() == '/';
         if self_closing {
             self.consume_char();
         }
         self.skip_until('>');
-        self.consume_char();
+        if !self.eof() {
+            self.consume_char();
+        }
 
         let children = if self_closing {
             Vec::new()
@@ -141,7 +143,9 @@ impl<'a> Parser<'a> {
         self.consume_char();
         let tag_name = self.consume_tag_name();
         self.skip_until('>');
-        self.consume_char();
+        if !self.eof() {
+            self.consume_char();
+        }
         tag_name
     }
 
@@ -166,8 +170,13 @@ impl<'a> Parser<'a> {
 
     fn consume_until_closing_tag(&mut self, tag_name: &str) {
         let closing = format!("</{tag_name}");
-        while !self.eof() && !self.input[self.position..].to_ascii_lowercase().starts_with(&closing)
-        {
+        while !self.eof() {
+            let rest = &self.input[self.position..];
+            if rest.len() >= closing.len()
+                && rest[..closing.len()].eq_ignore_ascii_case(&closing)
+            {
+                break;
+            }
             self.consume_char();
         }
         if !self.eof() {
@@ -203,7 +212,7 @@ impl<'a> Parser<'a> {
     }
 
     fn next_char(&self) -> char {
-        self.input[self.position..].chars().next().unwrap()
+        self.input[self.position..].chars().next().unwrap_or('\0')
     }
 
     fn starts_with(&self, pattern: &str) -> bool {
@@ -220,7 +229,11 @@ fn is_empty_text(node: &Node) -> bool {
 }
 
 fn is_void_element(tag_name: &str) -> bool {
-    matches!(tag_name, "br" | "hr" | "img" | "input" | "meta" | "link")
+    matches!(
+        tag_name,
+        "br" | "hr" | "img" | "input" | "meta" | "link" | "area" | "base" | "col" | "embed"
+            | "param" | "source" | "track" | "wbr"
+    )
 }
 
 fn is_ignored_content_element(tag_name: &str) -> bool {
@@ -234,9 +247,9 @@ fn collapse_whitespace(text: &str) -> String {
 fn decode_entities(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
-        .replace("&amp;", "&")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
+        .replace("&amp;", "&")
 }
 
 #[cfg(test)]

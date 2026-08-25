@@ -351,6 +351,11 @@ impl<'a> Canvas<'a> {
         if out_width <= 0 || out_height <= 0 || src_width == 0 || src_height == 0 {
             return;
         }
+        let sw = src_width as usize;
+        let sh = src_height as usize;
+        if rgba.len() < sw * sh * 4 {
+            return;
+        }
         let bg = background.map(|color| {
             (
                 ((color >> 16) & 0xFF) as u32,
@@ -511,7 +516,10 @@ impl App {
         };
         let len = (width as usize).saturating_mul(height as usize);
         let buflen = buffer.len();
-        let buf = &mut buffer[..len.min(buflen)];
+        if len > buflen {
+            return;
+        }
+        let buf = &mut buffer[..len];
         let mut canvas = Canvas::new(width, height, buf);
         match &self.modal {
             Some(Modal::About { tab }) => {
@@ -591,6 +599,9 @@ impl App {
                 } else if let Some(engine) = settings_engine_at(lx, ly) {
                     working.search_engine = SearchEngine::all()[engine];
                     *url_cursor = working.search_url.len();
+                    if working.search_engine != SearchEngine::Custom {
+                        *url_focused = false;
+                    }
                 } else if settings_url_at(lx, ly) {
                     *url_focused = true;
                     *url_cursor = working.search_url.len();
@@ -799,20 +810,11 @@ impl App {
     }
 
     fn on_mouse_leave(&mut self) {
-        if self.modal.is_some() {
-            return;
-        }
-        if self.app.hover_href.is_some()
-            || self.app.hover_button.is_some()
-            || self.app.hover_close.is_some()
-            || self.app.hover_shield
-        {
-            self.app.hover_href = None;
-            self.app.hover_button = None;
-            self.app.hover_close = None;
-            self.app.hover_shield = false;
-            sync_link_cursor(&self.window, false);
-        }
+        self.app.hover_href = None;
+        self.app.hover_button = None;
+        self.app.hover_close = None;
+        self.app.hover_shield = false;
+        sync_link_cursor(&self.window, false);
     }
 
     fn on_key(&mut self, event: &KeyEvent) {
@@ -1574,7 +1576,7 @@ fn draw_text_with_links(
 }
 
 fn draw_scrollbar(app: &BrowserApp, canvas: &mut Canvas) {
-    let track_x = (app.window_width - 18) as c_int;
+    let track_x = app.window_width.saturating_sub(18) as c_int;
     let track_y = MARGIN_Y as c_int;
     let track_height = app.viewport_height() as c_int;
     let max_scroll = app.max_scroll_y();
@@ -1595,7 +1597,7 @@ fn draw_scrollbar(app: &BrowserApp, canvas: &mut Canvas) {
 }
 
 fn draw_status_bar(app: &BrowserApp, canvas: &mut Canvas) {
-    let y = (app.window_height - STATUS_BAR_HEIGHT) as c_int;
+    let y = app.window_height.saturating_sub(STATUS_BAR_HEIGHT) as c_int;
     canvas.set_fg(pal(COLOR_STATUS_BAR));
     canvas.fill_rect(0, y, app.window_width as c_int, STATUS_BAR_HEIGHT as c_int);
     canvas.set_fg(pal(COLOR_MUTED_TEXT));

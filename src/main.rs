@@ -8,6 +8,7 @@ use std::os::raw::{c_int, c_uint};
 use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 mod engine;
 mod ui;
@@ -95,10 +96,10 @@ const COLOR_SHIELD_BLUE: u32 = 0x3B82F6;
 const COLOR_SHIELD_OUTLINE: u32 = 0xF2F4F6;
 const COLOR_SHIELD_DANGER: u32 = 0xD64545;
 
-static mut LIGHT_MODE: bool = false;
+static LIGHT_MODE: AtomicBool = AtomicBool::new(false);
 
 fn light_mode_enabled() -> bool {
-    unsafe { LIGHT_MODE }
+    LIGHT_MODE.load(Ordering::Relaxed)
 }
 
 fn pal(color: u32) -> u32 {
@@ -141,9 +142,7 @@ fn pal(color: u32) -> u32 {
 }
 
 fn apply_settings(settings: &Settings) {
-    unsafe {
-        LIGHT_MODE = settings.light_mode;
-    }
+    LIGHT_MODE.store(settings.light_mode, Ordering::Relaxed);
 }
 
 fn config_file() -> Option<PathBuf> {
@@ -1027,13 +1026,17 @@ fn absolutize_local_refs(html: &str, dir: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
     loop {
-        let pos = match (rest.find("src=\""), rest.find("href=\"")) {
-            (Some(a), Some(b)) => a.min(b),
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
+        let src_pos = rest.find("src=\"");
+        let href_pos = rest.find("href=\"");
+        let (pos, prefix_len) = match (src_pos, href_pos) {
+            (Some(a), Some(b)) => {
+                if a <= b { (a, 5) } else { (b, 6) }
+            }
+            (Some(a), None) => (a, 5),
+            (None, Some(b)) => (b, 6),
             (None, None) => break,
         };
-        let value_start = pos + 5;
+        let value_start = pos + prefix_len;
         let Some(rel_end) = rest[value_start..].find('"') else {
             break;
         };
@@ -1215,6 +1218,8 @@ fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn collect_img_srcs(node: &engine::dom::Node, out: &mut Vec<String>) {
@@ -1329,10 +1334,10 @@ fn is_private_host(host: &str) -> bool {
 
 fn is_private_ipv6(host: &str) -> bool {
     let lower = host.to_ascii_lowercase();
-    if lower == "::1" || lower == "0:0:0:0:0:0:0:1" {
+    if lower == "::1" || lower == "0:0:0:0:0:0:0:1" || lower == "::" {
         return true;
     }
-    lower.starts_with("fe80:")
+    lower.starts_with("fe80:") || lower.starts_with("fc") || lower.starts_with("fd")
 }
 
 /// Removes a trailing `:port` (digits) unless the host looks like IPv6.
@@ -1609,7 +1614,7 @@ fn point_in_menu_button(x: c_int, y: c_int) -> Option<usize> {
 fn menu_item_at(menu: usize, x: c_int, y: c_int) -> Option<usize> {
     let items = MENU_ITEMS.get(menu)?;
     let bx = menu_button_x(menu);
-    if x < bx || x > bx + MENU_ITEM_WIDTH {
+    if x < bx || x >= bx + MENU_ITEM_WIDTH {
         return None;
     }
     for (i, _) in items.iter().enumerate() {
