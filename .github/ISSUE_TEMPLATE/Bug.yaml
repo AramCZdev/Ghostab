@@ -15,7 +15,9 @@ body:
     attributes:
       label: Platform
       options:
-        - Linux Debian
+        - Windows
+        - Linux (Debian)
+        - Linux (Flatpak)
     validations:
       required: true
 
@@ -23,7 +25,7 @@ body:
     id: os
     attributes:
       label: Operating System Version
-      placeholder: "Example: Linux Mint 22.3, Ubuntu 26.04"
+      placeholder: "Example: Windows 11 25H2, Linux Mint 22.3, Ubuntu 26.04"
 
   - type: input
     id: desktop_environment
