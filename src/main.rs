@@ -5,10 +5,11 @@ use std::env;
 use std::fs;
 use std::io::Cursor;
 use std::os::raw::{c_int, c_uint};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 mod engine;
 mod ui;
@@ -54,6 +55,34 @@ const MARGIN_Y: usize = TITLE_BAR_HEIGHT + 34;
 // single page from exhausting memory or being used to reach internal hosts.
 const MAX_DOWNLOAD_BYTES: &str = "52428800"; // 50 MiB, enforced by curl --max-filesize
 const MAX_DOWNLOAD_TIME_SECS: &str = "20";
+
+/// Browser identity sent with every request. Engines reject requests that
+/// claim a platform the user is not on, so this follows the host OS.
+fn user_agent() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+    } else if cfg!(target_os = "macos") {
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.6; rv:128.0) Gecko/20100101 Firefox/128.0"
+    } else {
+        "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+    }
+}
+
+/// Where curl stores cookies between requests.
+fn cookie_jar() -> Option<PathBuf> {
+    if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir).join("ghostab").join("cookies.txt"));
+        }
+    }
+    if let Ok(home) = env::var("HOME") {
+        return Some(PathBuf::from(home).join(".config").join("ghostab").join("cookies.txt"));
+    }
+    if let Ok(appdata) = env::var("APPDATA") {
+        return Some(PathBuf::from(appdata).join("ghostab").join("cookies.txt"));
+    }
+    None
+}
 const MAX_IMAGE_DIMENSION: u32 = 8192; // reject images wider/taller than this
 const MAX_IMAGE_PIXELS: u64 = 40_000_000; // reject images with more pixels than this
 const MAX_PAGE_IMAGES: usize = 64; // cap auto-loaded <img> per page
@@ -176,10 +205,10 @@ fn load_settings() -> Settings {
                     match key {
                         "light_mode" => settings.light_mode = value == "true",
                         "search_engine" => {
-                            settings.search_engine = if value == "custom" {
-                                SearchEngine::Custom
-                            } else {
-                                SearchEngine::Startpage
+                            settings.search_engine = match value {
+                                "startpage" => SearchEngine::Startpage,
+                                "custom" => SearchEngine::Custom,
+                                _ => SearchEngine::RightDao,
                             };
                         }
                         "search_url" => settings.search_url = value.to_string(),
@@ -199,10 +228,7 @@ fn save_settings(settings: &Settings) {
     if let Some(dir) = path.parent() {
         let _ = fs::create_dir_all(dir);
     }
-    let engine = match settings.search_engine {
-        SearchEngine::Startpage => "startpage",
-        SearchEngine::Custom => "custom",
-    };
+    let engine = settings.search_engine.slug();
     let text = format!(
         "# Ghostab settings\nlight_mode = {}\nsearch_engine = {}\nsearch_url = {}\n",
         settings.light_mode,
@@ -289,6 +315,10 @@ struct BrowserApp {
     hover_close: Option<usize>,
     hover_shield: bool,
     settings: Settings,
+    // Set while a remote fetch is in flight. The blocking curl call is
+    // deferred to the event loop so the spinner can actually paint first.
+    loading: Option<String>,
+    loading_started: Instant,
 }
 
 #[derive(Clone)]
@@ -323,6 +353,7 @@ enum ConnectionState {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum SearchEngine {
+    RightDao,
     Startpage,
     Custom,
 }
@@ -330,13 +361,22 @@ enum SearchEngine {
 impl SearchEngine {
     fn label(self) -> &'static str {
         match self {
+            Self::RightDao => "Right Dao",
             Self::Startpage => "Startpage",
             Self::Custom => "Custom",
         }
     }
 
-    fn all() -> [SearchEngine; 2] {
-        [Self::Startpage, Self::Custom]
+    fn slug(self) -> &'static str {
+        match self {
+            Self::RightDao => "rightdao",
+            Self::Startpage => "startpage",
+            Self::Custom => "custom",
+        }
+    }
+
+    fn all() -> [SearchEngine; 3] {
+        [Self::RightDao, Self::Startpage, Self::Custom]
     }
 }
 
@@ -351,7 +391,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             light_mode: false,
-            search_engine: SearchEngine::Startpage,
+            search_engine: SearchEngine::RightDao,
             search_url: String::new(),
         }
     }
@@ -400,6 +440,8 @@ impl BrowserApp {
             hover_close: None,
             hover_shield: false,
             settings: Settings::default(),
+            loading: None,
+            loading_started: Instant::now(),
         };
         app.relayout();
         app.tabs.push(app.snapshot());
@@ -435,6 +477,9 @@ impl BrowserApp {
         self.scroll_y = tab.scroll_y;
         self.hover_href = None;
         self.hover_close = None;
+        // A pending fetch belongs to the tab that started it. Dropping it
+        // here stops a late result from overwriting the tab we switched to.
+        self.loading = None;
         self.address_cursor = self.address_cursor.min(self.address_text.len());
         self.relayout();
     }
@@ -560,6 +605,25 @@ impl BrowserApp {
     }
 
     fn navigate_to(&mut self, target: &str) {
+        // Remote fetches block on curl, so paint a placeholder and defer the
+        // real load to the event loop. That gives the spinner a frame to show
+        // instead of freezing the window until the download finishes.
+        if is_url(target) {
+            self.loading = Some(target.to_string());
+            self.loading_started = Instant::now();
+            self.page = BrowserPage {
+                source: target.to_string(),
+                html: loading_page(target),
+                title: format!("Loading {}", target),
+            };
+            self.relayout();
+            self.address_text = target.to_string();
+            self.address_cursor = self.address_text.len();
+            self.address_anchor = None;
+            self.hover_href = None;
+            self.scroll_y = 0;
+            return;
+        }
         self.page = load_page(Some(target));
         eprintln!("ghostab-log: navigate_to '{}' -> title='{}'", target, self.page.title);
         self.relayout();
@@ -569,6 +633,35 @@ impl BrowserApp {
         self.hover_href = None;
         self.scroll_y = 0;
         self.sync_active_tab();
+    }
+
+    /// Run a deferred remote fetch started by `navigate_to`.
+    fn finish_pending_load(&mut self) {
+        let Some(target) = self.loading.take() else {
+            return;
+        };
+        self.page = load_page(Some(&target));
+        eprintln!(
+            "ghostab-log: navigate_to '{}' -> title='{}' ({:.0}ms)",
+            target,
+            self.page.title,
+            self.loading_started.elapsed().as_secs_f64() * 1000.0
+        );
+        self.relayout();
+        self.address_text = target.clone();
+        self.address_cursor = self.address_text.len();
+        self.address_anchor = None;
+        self.hover_href = None;
+        self.scroll_y = 0;
+        self.sync_active_tab();
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.loading.is_some()
+    }
+
+    pub fn loading_elapsed(&self) -> f64 {
+        self.loading_started.elapsed().as_secs_f64()
     }
 
     fn resize(&mut self, width: usize, height: usize) {
@@ -1070,12 +1163,13 @@ fn is_relative_ref(value: &str) -> bool {
 fn search_url_for(settings: &Settings, query: &str) -> String {
     let q = urlencode_query(query);
     match settings.search_engine {
+        SearchEngine::RightDao => format!("https://rightdao.com/search?q={q}"),
         SearchEngine::Startpage => format!("https://www.startpage.com/sp/search?query={q}"),
         SearchEngine::Custom => {
             if settings.search_url.contains("%s") {
                 settings.search_url.replace("%s", &q)
             } else {
-                format!("https://www.startpage.com/sp/search?query={q}")
+                format!("https://rightdao.com/search?q={q}")
             }
         }
     }
@@ -1167,9 +1261,35 @@ fn fetch_url(url: &str) -> BrowserPage {
         "=http,https",
         "--silent",
         "--show-error",
+        // Ask for compressed responses so pages transfer faster.
+        "--compressed",
         "-A",
-        "Mozilla/5.0 (X11; Linux x86_64; rv:115.0) Gecko/20100101 Firefox/115.0",
+        user_agent(),
+        // Search engines serve an "unusual traffic" captcha page when a
+        // request looks like a bare bot. These are the headers a real Firefox
+        // navigation sends; sending them keeps results working.
+        "-H",
+        "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "-H",
+        "Accept-Language: en-US,en;q=0.5",
+        "-H",
+        "Upgrade-Insecure-Requests: 1",
+        "-H",
+        "Sec-Fetch-Dest: document",
+        "-H",
+        "Sec-Fetch-Mode: navigate",
+        "-H",
+        "Sec-Fetch-Site: none",
+        "-H",
+        "Sec-Fetch-User: ?1",
     ]);
+    // Persist cookies across requests so engines see a continuing session
+    // instead of a stream of unrelated one-shot visitors.
+    if let Some(jar) = cookie_jar() {
+        let _ = fs::create_dir_all(jar.parent().unwrap_or(Path::new(".")));
+        cmd.arg("--cookie-jar").arg(&jar);
+        cmd.arg("--cookie").arg(&jar);
+    }
     if let Some(query) = url.strip_prefix("https://www.startpage.com/sp/search?query=") {
         cmd.arg("-d").arg(format!("query={query}"));
         cmd.arg("https://www.startpage.com/sp/search");
@@ -1204,6 +1324,13 @@ fn fetch_url(url: &str) -> BrowserPage {
             title: "Could not start network loader".to_string(),
         },
     }
+}
+
+fn loading_page(target: &str) -> String {
+    format!(
+        "<html><body><h1>Loading</h1><p>Fetching {}</p></body></html>",
+        escape_html(target)
+    )
 }
 
 fn error_page(title: &str, message: &str) -> String {
@@ -1687,9 +1814,10 @@ const SETTINGS_OK_W: c_int = 92;
 const SETTINGS_OK_H: c_int = 34;
 const SETTINGS_CANCEL_X: c_int = 344;
 const SETTINGS_URL_X: c_int = 28;
-const SETTINGS_URL_Y: c_int = 228;
+const SETTINGS_URL_Y: c_int = 250;
 const SETTINGS_URL_W: c_int = 404;
 const SETTINGS_URL_H: c_int = 30;
+const SETTINGS_URL_LABEL_Y: c_int = 244;
 
 fn edit_insert(text: &mut String, cursor: &mut usize, insertion: &str) {
     text.insert_str(*cursor, insertion);
@@ -1727,11 +1855,11 @@ fn settings_light_row_at(x: c_int, y: c_int) -> bool {
     (96..=124).contains(&y) && (24..=220).contains(&x)
 }
 
-fn settings_engine_at(x: c_int, y: c_int) -> Option<usize> {
-    for (i, _) in SearchEngine::all().iter().enumerate() {
+fn settings_engine_at(x: c_int, y: c_int) -> Option<SearchEngine> {
+    for (i, engine) in SearchEngine::all().into_iter().enumerate() {
         let ey = 162 + i as c_int * 28;
-        if (ey..ey + 20).contains(&y) && (24..=200).contains(&x) {
-            return Some(i);
+        if (ey..ey + 20).contains(&y) && (24..=220).contains(&x) {
+            return Some(engine);
         }
     }
     None
@@ -1878,7 +2006,7 @@ mod tests {
         assert_eq!(normalize_navigation_target("[::1]:8080", &Settings::default()), "http://[::1]:8080");
         assert_eq!(
             normalize_navigation_target("localhost settings", &Settings::default()),
-            "https://www.startpage.com/sp/search?query=localhost+settings"
+            "https://rightdao.com/search?q=localhost+settings"
         );
     }
 
@@ -1899,17 +2027,49 @@ mod tests {
     }
 
     #[test]
-    fn plain_search_input_goes_to_startpage() {
+    fn plain_search_input_goes_to_rightdao() {
         assert_eq!(
             normalize_navigation_target("rust tutorial", &Settings::default()),
-            "https://www.startpage.com/sp/search?query=rust+tutorial"
+            "https://rightdao.com/search?q=rust+tutorial"
         );
         assert_eq!(
             normalize_navigation_target("c++ & rust", &Settings::default()),
-            "https://www.startpage.com/sp/search?query=c%2B%2B+%26+rust"
+            "https://rightdao.com/search?q=c%2B%2B+%26+rust"
         );
         assert_eq!(
             normalize_navigation_target("ghostab", &Settings::default()),
+            "https://rightdao.com/search?q=ghostab"
+        );
+    }
+
+    #[test]
+    fn settings_engine_rows_do_not_overlap_the_url_field() {
+        let last = SearchEngine::all().into_iter().count() as c_int - 1;
+        let last_bottom = 162 + last * 28 + 20;
+        assert!(last_bottom <= SETTINGS_URL_LABEL_Y);
+        assert!(SETTINGS_URL_Y + SETTINGS_URL_H <= SETTINGS_OK_Y - 8);
+    }
+
+    #[test]
+    fn engine_hit_testing_maps_y_to_the_right_engine() {
+        let engines = SearchEngine::all();
+        for (i, engine) in engines.into_iter().enumerate() {
+            let y = 162 + i as c_int * 28 + 10;
+            assert_eq!(settings_engine_at(30, y), Some(engine));
+        }
+        assert_eq!(settings_engine_at(30, 150), None);
+    }
+
+    #[test]
+    fn startpage_remains_selectable() {
+        let mut settings = Settings::default();
+        settings.search_engine = SearchEngine::Startpage;
+        assert_eq!(
+            search_url_for(&settings, "rust tutorial"),
+            "https://www.startpage.com/sp/search?query=rust+tutorial"
+        );
+        assert_eq!(
+            normalize_navigation_target("ghostab", &settings),
             "https://www.startpage.com/sp/search?query=ghostab"
         );
     }
@@ -1919,7 +2079,7 @@ mod tests {
         let mut settings = Settings::default();
         assert_eq!(
             search_url_for(&settings, "rust tutorial"),
-            "https://www.startpage.com/sp/search?query=rust+tutorial"
+            "https://rightdao.com/search?q=rust+tutorial"
         );
         settings.search_engine = SearchEngine::Custom;
         settings.search_url = "https://example.com/search?q=%s".to_string();
@@ -1938,15 +2098,15 @@ mod tests {
         settings.search_url = String::new();
         assert_eq!(
             search_url_for(&settings, "rust tutorial"),
-            "https://www.startpage.com/sp/search?query=rust+tutorial"
+            "https://rightdao.com/search?q=rust+tutorial"
         );
     }
 
     #[test]
-    fn settings_default_to_dark_mode_and_startpage() {
+    fn settings_default_to_dark_mode_and_rightdao() {
         let settings = Settings::default();
         assert_eq!(settings.light_mode, false);
-        assert_eq!(settings.search_engine, SearchEngine::Startpage);
+        assert_eq!(settings.search_engine, SearchEngine::RightDao);
         assert_eq!(settings.search_url, "");
     }
 
@@ -2211,6 +2371,60 @@ mod tests {
             normalize_navigation_target("file:///home/aramcz/hi.html", &settings),
             "file:///home/aramcz/hi.html"
         );
+    }
+
+    #[test]
+    fn loading_page_escapes_the_target_url() {
+        let html = loading_page("https://example.com/?a=<b>&c=\"d\"");
+        assert!(!html.contains("<b>"));
+        assert!(html.contains("&lt;b&gt;"));
+        assert!(html.contains("&amp;"));
+    }
+
+    #[test]
+    fn remote_navigation_defers_the_fetch_until_the_event_loop_runs() {
+        let mut app = BrowserApp::new(load_page(None));
+        assert!(!app.is_loading());
+
+        app.navigate_to("https://example.com/");
+
+        // The fetch has not run yet: the placeholder is up and the target is
+        // parked for the event loop.
+        assert!(app.is_loading());
+        assert_eq!(app.page.source, "https://example.com/");
+        assert!(app.page.title.starts_with("Loading"));
+        assert_eq!(app.address_text, "https://example.com/");
+
+        app.finish_pending_load();
+        assert!(!app.is_loading());
+    }
+
+    #[test]
+    fn finishing_with_no_pending_load_is_a_no_op() {
+        let mut app = BrowserApp::new(load_page(None));
+        let before = app.page.source.clone();
+        app.finish_pending_load();
+        assert!(!app.is_loading());
+        assert_eq!(app.page.source, before);
+    }
+
+    #[test]
+    fn switching_tabs_drops_a_pending_load() {
+        let mut app = BrowserApp::new(load_page(None));
+        app.new_tab();
+        app.navigate_to("https://example.com/");
+        assert!(app.is_loading());
+
+        app.switch_tab(0);
+        assert!(!app.is_loading());
+    }
+
+    #[test]
+    fn local_pages_load_without_deferring() {
+        let mut app = BrowserApp::new(load_page(None));
+        app.navigate_to("about:blank");
+        assert!(!app.is_loading());
+        assert_eq!(app.page.title, "about:blank");
     }
 
     #[test]

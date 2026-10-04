@@ -5,7 +5,7 @@ use std::os::raw::c_int;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cosmic_text::{Attrs, Color, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{Attrs, Color, Family, FontSystem, Metrics, Shaping, SwashCache};
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -17,6 +17,33 @@ use winit::window::{CursorIcon, Icon, Window, WindowId};
 use crate::*;
 
 static FONT_STATE: Mutex<Option<FontState>> = Mutex::new(None);
+
+fn is_emoji(ch: char) -> bool {
+    matches!(ch,
+        '\u{1F600}'..='\u{1F64F}' | // Emoticons
+        '\u{1F300}'..='\u{1F5FF}' | // Misc Symbols and Pictographs
+        '\u{1F680}'..='\u{1F6FF}' | // Transport and Map
+        '\u{1F900}'..='\u{1F9FF}' | // Supplemental Symbols
+        '\u{1FA00}'..='\u{1FAFF}' | // Symbols and Pictographs Extended-A
+        '\u{2600}'..='\u{26FF}'   | // Misc Symbols
+        '\u{2700}'..='\u{27BF}'   | // Dingbats
+        '\u{FE00}'..='\u{FE0F}'   | // Variation Selectors
+        '\u{200D}'                 | // ZWJ
+        '\u{20E3}'                 | // Combining Enclosing Keycap
+        '\u{1F1E0}'..='\u{1F1FF}' | // Flags (Regional Indicators)
+        '\u{E0020}'..='\u{E007F}'   // Tags
+    )
+}
+
+fn emoji_font_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Segoe UI Emoji"
+    } else if cfg!(target_os = "macos") {
+        "Apple Color Emoji"
+    } else {
+        "Noto Color Emoji"
+    }
+}
 
 struct FontState {
     system: FontSystem,
@@ -48,7 +75,41 @@ impl FontState {
     }
 
     fn shape(&mut self, text: &str, width: f32, height: f32) {
-        self.buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
+        let default_attrs = Attrs::new();
+        let emoji_attrs = Attrs::new().family(Family::Name(emoji_font_name()));
+
+        let mut spans: Vec<(&str, Attrs)> = Vec::new();
+        let mut run_start = 0;
+        let mut in_emoji = false;
+
+        for (i, ch) in text.char_indices() {
+            let ch_is_emoji = is_emoji(ch);
+            if ch_is_emoji != in_emoji {
+                if i > run_start {
+                    let slice = &text[run_start..i];
+                    let attrs = if in_emoji {
+                        emoji_attrs.clone()
+                    } else {
+                        default_attrs.clone()
+                    };
+                    spans.push((slice, attrs));
+                }
+                run_start = i;
+                in_emoji = ch_is_emoji;
+            }
+        }
+        if run_start < text.len() {
+            let slice = &text[run_start..];
+            let attrs = if in_emoji {
+                emoji_attrs
+            } else {
+                default_attrs.clone()
+            };
+            spans.push((slice, attrs));
+        }
+
+        self.buffer
+            .set_rich_text(spans, &default_attrs, Shaping::Advanced, None);
         self.buffer.set_size(Some(width), Some(height));
         self.buffer.shape_until_scroll(&mut self.system, true);
     }
@@ -597,7 +658,7 @@ impl App {
                     working.light_mode = !working.light_mode;
                     apply_settings(working);
                 } else if let Some(engine) = settings_engine_at(lx, ly) {
-                    working.search_engine = SearchEngine::all()[engine];
+                    working.search_engine = engine;
                     *url_cursor = working.search_url.len();
                     if working.search_engine != SearchEngine::Custom {
                         *url_focused = false;
@@ -1106,6 +1167,20 @@ impl ApplicationHandler for App {
             event_loop.exit();
             return;
         }
+
+        // Run the deferred network fetch here so at least one frame with the
+        // spinner has been painted. Animating the dots needs a redraw tick,
+        // so poll while a load is in flight instead of sleeping.
+        if self.app.is_loading() {
+            self.app.finish_pending_load();
+            self.redraw();
+        }
+        if self.app.is_loading() {
+            event_loop.set_control_flow(ControlFlow::Poll);
+            self.redraw();
+            return;
+        }
+
         let mut close_shield = false;
         match &self.modal {
             Some(Modal::Shield { opened, .. }) => {
@@ -1169,8 +1244,40 @@ fn draw_browser(app: &BrowserApp, canvas: &mut Canvas) {
     draw_title_bar(app, canvas);
     draw_menu_bar(app, canvas);
     draw_box(app, canvas, &app.layout, app.scroll_y, height);
+    if app.is_loading() {
+        draw_loading_spinner(app, canvas, height);
+    }
     draw_scrollbar(app, canvas);
     draw_status_bar(app, canvas);
+}
+
+/// Rotating arc of dots shown while a remote fetch is in flight.
+fn draw_loading_spinner(app: &BrowserApp, canvas: &mut Canvas, height: c_int) {
+    const DOTS: usize = 10;
+    const RADIUS: f64 = 11.0;
+    // One full turn roughly every 800ms.
+    let phase = (app.loading_elapsed() / 0.8 * DOTS as f64) as usize;
+
+    let cx = (app.window_width / 2) as c_int;
+    let top = TITLE_BAR_HEIGHT as c_int;
+    let cy = top + (height - top - STATUS_BAR_HEIGHT as c_int) / 2;
+
+    let (dim, bright) = (COLOR_MUTED_TEXT, COLOR_LINK);
+
+    for i in 0..DOTS {
+        let angle = (i as f64) * std::f64::consts::TAU / DOTS as f64;
+        let x = cx + (angle.cos() * RADIUS).round() as c_int;
+        let y = cy + (angle.sin() * RADIUS).round() as c_int;
+        // Fade trailing dots so the arc reads as rotating.
+        let behind = (phase + DOTS - i) % DOTS;
+        let color = if behind == 0 { bright } else { dim };
+        canvas.set_fg(pal(color));
+        canvas.fill_circle(x, y, if behind == 0 { 3 } else { 2 });
+    }
+
+    canvas.set_fg(pal(COLOR_MUTED_TEXT));
+    let label = format!("Loading {:.1}s", app.loading_elapsed());
+    canvas.text_baseline(cx - (label.len() as c_int * CHAR_WIDTH as c_int) / 2, cy + 30, &label);
 }
 
 fn draw_title_bar(app: &BrowserApp, canvas: &mut Canvas) {
@@ -1808,7 +1915,7 @@ fn draw_settings_content(
 
     if settings.search_engine == SearchEngine::Custom {
         canvas.set_fg(pal(COLOR_MUTED_TEXT));
-        canvas.text_baseline(28, 222, "Search URL (use %s for the query)");
+        canvas.text_baseline(28, SETTINGS_URL_LABEL_Y, "Search URL (use %s for the query)");
         canvas.set_fg(pal(if url_focused {
             COLOR_ADDRESS_FOCUS
         } else {

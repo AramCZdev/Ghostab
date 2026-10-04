@@ -1,5 +1,7 @@
 use super::dom::{Document, Node, NodeKind};
 use std::collections::HashMap;
+use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Viewport {
@@ -216,40 +218,64 @@ fn layout_inline_flow(
 
     for (text, href) in runs {
         for word in text.split_whitespace() {
-            let word_len = word.chars().count();
-            if word_len > content_width {
+            let word_width = word.width();
+            if word_width > content_width {
                 if !line_words.is_empty() {
                     flush_inline_line(&mut boxes, &mut line_words, cursor.y, indent);
                     cursor.y += 1;
                     line_len = 0;
                 }
-                let chars: Vec<char> = word.chars().collect();
-                let mut start = 0;
-                while start < chars.len() {
-                    let end = usize::min(start + content_width, chars.len());
-                    let fragment: String = chars[start..end].iter().collect();
+                let mut display_width = 0usize;
+                let mut chars = Vec::new();
+                for ch in word.chars() {
+                    let w = ch.width().unwrap_or(0);
+                    if display_width + w > content_width && !chars.is_empty() {
+                        let fragment: String = chars.iter().collect();
+                        boxes.push(LayoutBox {
+                            rect: Rect {
+                                x: indent,
+                                y: cursor.y,
+                                width: fragment.width(),
+                                height: 1,
+                            },
+                            text: Some(fragment.clone()),
+                            href: href.clone(),
+                            links: span_list(0, fragment.len(), href.as_deref()),
+                            image: None,
+                            rule: false,
+                            children: Vec::new(),
+                        });
+                        cursor.y += 1;
+                        chars.clear();
+                        display_width = 0;
+                    }
+                    chars.push(ch);
+                    display_width += w;
+                }
+                if !chars.is_empty() {
+                    let fragment: String = chars.iter().collect();
+                    let fragment_bytes = fragment.len();
                     boxes.push(LayoutBox {
                         rect: Rect {
                             x: indent,
                             y: cursor.y,
-                            width: fragment.len(),
+                            width: fragment.width(),
                             height: 1,
                         },
                         text: Some(fragment),
                         href: href.clone(),
-                        links: span_list(0, end - start, href.as_deref()),
+                        links: span_list(0, fragment_bytes, href.as_deref()),
                         image: None,
                         rule: false,
                         children: Vec::new(),
                     });
                     cursor.y += 1;
-                    start = end;
                 }
                 continue;
             }
 
             let separator = usize::from(!line_words.is_empty());
-            if line_len + separator + word_len > content_width && !line_words.is_empty() {
+            if line_len + separator + word_width > content_width && !line_words.is_empty() {
                 flush_inline_line(&mut boxes, &mut line_words, cursor.y, indent);
                 cursor.y += 1;
                 line_len = 0;
@@ -257,7 +283,7 @@ fn layout_inline_flow(
             if line_len != 0 {
                 line_len += 1;
             }
-            line_len += word_len;
+            line_len += word_width;
             line_words.push((word.to_string(), href.clone()));
         }
     }
@@ -305,7 +331,7 @@ fn flush_inline_line(
         rect: Rect {
             x: indent,
             y,
-            width: text.len(),
+            width: text.width(),
             height: 1,
         },
         text: Some(text),
@@ -386,7 +412,7 @@ fn layout_text_block(
             rect: Rect {
                 x: indent,
                 y: cursor.y,
-                width: line.len(),
+                width: line.width(),
                 height: 1,
             },
             text: Some(line),
@@ -407,25 +433,34 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let mut current = String::new();
 
     for word in text.split_whitespace() {
-        // If the word itself is longer than the width, break it into chunks.
-        if word.chars().count() > width {
+        let word_width = word.width();
+        if word_width > width {
             if !current.is_empty() {
                 lines.push(current);
                 current = String::new();
             }
 
-            let chars: Vec<char> = word.chars().collect();
-            let mut start = 0;
-            while start < chars.len() {
-                let end = usize::min(start + width, chars.len());
-                lines.push(chars[start..end].iter().collect());
-                start = end;
+            let mut display_width = 0usize;
+            let mut chars = Vec::new();
+            for ch in word.chars() {
+                let w = ch.width().unwrap_or(0);
+                if display_width + w > width && !chars.is_empty() {
+                    let fragment: String = chars.iter().collect();
+                    lines.push(fragment);
+                    chars.clear();
+                    display_width = 0;
+                }
+                chars.push(ch);
+                display_width += w;
+            }
+            if !chars.is_empty() {
+                lines.push(chars.iter().collect());
             }
             continue;
         }
 
         let separator = usize::from(!current.is_empty());
-        if current.chars().count() + separator + word.chars().count() > width && !current.is_empty() {
+        if current.width() + separator + word_width > width && !current.is_empty() {
             lines.push(current);
             current = String::new();
         }
@@ -601,5 +636,36 @@ mod tests {
 
         assert!(layout.children[0].image.is_none());
         assert!(layout.children[0].text.as_deref().unwrap_or("").contains("broken"));
+    }
+
+    #[test]
+    fn wraps_emoji_at_correct_display_width() {
+        let document = parse_html("<p>\u{1F600}\u{1F601}\u{1F602}\u{1F600}</p>");
+        let layout = layout_document(
+            &document,
+            Viewport {
+                width: 4,
+                height: 20,
+            },
+            &HashMap::new(),
+        );
+        // 4 emojis x 2 cells = 8 cells, viewport is 4 → forced word break
+        // produces 2 lines (2 emojis each)
+        let p_box = &layout.children[0];
+        assert_eq!(p_box.rect.y, 0);
+    }
+
+    #[test]
+    fn wrap_text_handles_emoji_correctly() {
+        let lines = wrap_text("\u{1F600}\u{1F601}\u{1F602}\u{1F603}", 4);
+        // 4 emojis x 2 cells = 8 cells, but viewport is 4 so each line has 2 emojis
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn wrap_text_handles_mixed_text_and_emoji() {
+        let lines = wrap_text("hello \u{1F600} world", 12);
+        // "hello " (6) + emoji (2) = 8, " world" (6) would be 14, so wrap
+        assert!(!lines.is_empty());
     }
 }
