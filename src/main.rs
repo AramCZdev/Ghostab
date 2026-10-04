@@ -56,6 +56,9 @@ const MARGIN_Y: usize = TITLE_BAR_HEIGHT + 34;
 const MAX_DOWNLOAD_BYTES: &str = "52428800"; // 50 MiB, enforced by curl --max-filesize
 const MAX_DOWNLOAD_TIME_SECS: &str = "20";
 
+/// How many closed tabs Ctrl+Shift+T can walk back through.
+const MAX_CLOSED_TABS: usize = 25;
+
 /// Browser identity sent with every request. Engines reject requests that
 /// claim a platform the user is not on, so this follows the host OS.
 fn user_agent() -> &'static str {
@@ -311,6 +314,8 @@ struct BrowserApp {
     window_height: usize,
     tabs: Vec<TabSnapshot>,
     active_tab: usize,
+    // Recently closed tabs, newest last. Bounded like the history stacks.
+    closed_tabs: Vec<(usize, TabSnapshot)>,
     hover_button: Option<NavButton>,
     hover_close: Option<usize>,
     hover_shield: bool,
@@ -436,6 +441,7 @@ impl BrowserApp {
             window_height,
             tabs: Vec::new(),
             active_tab: 0,
+            closed_tabs: Vec::new(),
             hover_button: None,
             hover_close: None,
             hover_shield: false,
@@ -504,13 +510,31 @@ impl BrowserApp {
             return true;
         }
         self.sync_active_tab();
-        self.tabs.remove(index);
+        // Keep the closed tab's state so Ctrl+Shift+T can bring it back.
+        let closed = self.tabs.remove(index);
+        if self.closed_tabs.len() >= MAX_CLOSED_TABS {
+            self.closed_tabs.remove(0);
+        }
+        self.closed_tabs.push((index, closed));
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
         }
         self.restore(self.tabs[self.active_tab].clone());
         self.address_focused = false;
         false
+    }
+
+    /// Reopen the most recently closed tab, as Ctrl+Shift+T does elsewhere.
+    fn reopen_closed_tab(&mut self) {
+        let Some((index, snapshot)) = self.closed_tabs.pop() else {
+            return;
+        };
+        let at = index.min(self.tabs.len());
+        self.tabs.insert(at, snapshot);
+        self.sync_active_tab();
+        self.active_tab = at;
+        self.restore(self.tabs[at].clone());
+        self.address_focused = false;
     }
 
     fn switch_tab(&mut self, index: usize) {
@@ -653,6 +677,29 @@ impl BrowserApp {
         self.address_anchor = None;
         self.hover_href = None;
         self.scroll_y = 0;
+        self.sync_active_tab();
+    }
+
+    /// Abandon an in-flight fetch and return to the previously loaded page,
+    /// which is what Escape does while a page is loading.
+    fn cancel_loading(&mut self) {
+        if self.loading.take().is_none() {
+            return;
+        }
+        if let Some(previous) = self.history_back.pop() {
+            self.history_forward.push(self.page.source.clone());
+            self.page = load_page(Some(&previous));
+            self.address_text = previous;
+            self.address_cursor = self.address_text.len();
+        } else {
+            self.page = load_page(None);
+            self.address_text = self.page.source.clone();
+            self.address_cursor = self.address_text.len();
+        }
+        self.address_anchor = None;
+        self.hover_href = None;
+        self.scroll_y = 0;
+        self.relayout();
         self.sync_active_tab();
     }
 
@@ -859,6 +906,57 @@ impl BrowserApp {
     fn copy_selection(&self) -> Option<String> {
         self.selection_range()
             .map(|(start, end)| self.address_text[start..end].to_string())
+    }
+
+    fn move_word(&mut self, right: bool, extend: bool) {
+        let old = self.address_cursor;
+        let new = if right {
+            next_word_index(&self.address_text, old)
+        } else {
+            prev_word_index(&self.address_text, old)
+        };
+        self.address_cursor = new;
+        if extend {
+            if self.address_anchor.is_none() {
+                self.address_anchor = Some(old);
+            }
+        } else {
+            self.address_anchor = None;
+        }
+    }
+
+    fn delete_word_backward(&mut self) {
+        // With a selection active, Backspace deletes just the selection.
+        if let Some((start, end)) = self.selection_range() {
+            self.address_text.replace_range(start..end, "");
+            self.address_cursor = start;
+            self.address_anchor = None;
+            return;
+        }
+        let start = prev_word_index(&self.address_text, self.address_cursor);
+        if start < self.address_cursor {
+            self.address_text
+                .replace_range(start..self.address_cursor, "");
+            self.address_cursor = start;
+        }
+    }
+
+    fn delete_to_line_start(&mut self) {
+        if let Some((start, end)) = self.selection_range() {
+            self.address_text.replace_range(start..end, "");
+            self.address_cursor = start;
+            self.address_anchor = None;
+            return;
+        }
+        // The address bar is a single line, so "delete to line start" means
+        // delete everything before the caret.
+        let cursor = self.address_cursor;
+        if cursor == 0 {
+            return;
+        }
+        self.address_text.replace_range(..cursor, "");
+        self.address_cursor = 0;
+        self.address_anchor = None;
     }
 }
 
@@ -1565,6 +1663,38 @@ fn next_char_index(text: &str, index: usize) -> usize {
     }
 }
 
+/// Word boundaries for Ctrl+Arrow and Ctrl+Backspace. Treats runs of
+/// non-alphanumerics (slashes, dots, dashes) as separators, so arrows step
+/// through `https`, `example`, `com`, `path` the way browsers do.
+fn prev_word_index(text: &str, index: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = index.min(text.len());
+    // Skip whitespace backwards first.
+    while i > 0 && !is_word_byte(bytes[i - 1]) {
+        i -= 1;
+    }
+    while i > 0 && is_word_byte(bytes[i - 1]) {
+        i -= 1;
+    }
+    i
+}
+
+fn next_word_index(text: &str, index: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = index.min(text.len());
+    while i < bytes.len() && is_word_byte(bytes[i]) {
+        i += 1;
+    }
+    while i < bytes.len() && !is_word_byte(bytes[i]) {
+        i += 1;
+    }
+    i
+}
+
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 static ICON_PNG: &[u8] = include_bytes!("../Ghostab.png");
 
 fn refresh_button_x(window_width: usize) -> c_int {
@@ -2217,7 +2347,131 @@ mod tests {
     }
 
     #[test]
-    fn switching_tabs_keeps_each_pages_state() {
+    fn ctrl_shift_t_reopens_the_closed_tab() {
+        let mut app = BrowserApp::new(load_page(None));
+        app.navigate_new("about:sample");
+        app.new_tab();
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab, 1);
+
+        assert!(!app.close_tab(1));
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.closed_tabs.len(), 1);
+
+        app.reopen_closed_tab();
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab, 1);
+        // The restored tab comes back where it was, not as a blank page.
+        assert_eq!(app.page.source, "ghostab:newpage");
+    }
+
+    #[test]
+    fn reopening_with_no_closed_tabs_does_nothing() {
+        let mut app = BrowserApp::new(load_page(None));
+        app.navigate_new("about:sample");
+        let before = app.page.source.clone();
+        app.reopen_closed_tab();
+        assert_eq!(app.page.source, before);
+        assert_eq!(app.tabs.len(), 1);
+    }
+
+    #[test]
+    fn closed_tab_history_is_bounded() {
+        let mut app = BrowserApp::new(load_page(None));
+        for _ in 0..(MAX_CLOSED_TABS + 5) {
+            app.new_tab();
+            let index = app.active_tab;
+            app.close_tab(index);
+        }
+        assert!(app.closed_tabs.len() <= MAX_CLOSED_TABS);
+    }
+
+    #[test]
+    fn closing_the_last_tab_reports_that_the_window_should_close() {
+        let mut app = BrowserApp::new(load_page(None));
+        assert!(app.close_tab(0));
+    }
+
+    #[test]
+    fn escape_cancels_an_in_flight_load() {
+        let mut app = BrowserApp::new(load_page(None));
+        app.navigate_new("about:sample");
+        app.navigate_new("https://example.com/");
+        assert!(app.is_loading());
+
+        app.cancel_loading();
+        assert!(!app.is_loading());
+        // Back to the page we came from, not the placeholder.
+        assert_eq!(app.page.source, "about:sample");
+    }
+
+    #[test]
+    fn cancelling_with_nothing_loading_leaves_the_page_alone() {
+        let mut app = BrowserApp::new(load_page(None));
+        app.navigate_new("about:sample");
+        let before = app.page.source.clone();
+        app.cancel_loading();
+        assert_eq!(app.page.source, before);
+    }
+
+    #[test]
+    fn word_boundaries_step_over_punctuation() {
+        let text = "https://example.com/path";
+        // Forward from the start walks scheme, host, then path segments.
+        let mut index = 0;
+        let mut seen = Vec::new();
+        while index < text.len() {
+            index = next_word_index(text, index);
+            if index < text.len() {
+                seen.push(&text[..index]);
+            }
+        }
+        assert!(seen.contains(&"https://"), "got {seen:?}");
+        assert!(seen.contains(&"https://example."), "got {seen:?}");
+        assert!(seen.contains(&"https://example.com/"), "got {seen:?}");
+        // And backward from the end retraces the last segment.
+        assert_eq!(prev_word_index(text, text.len()), text.len() - 4);
+    }
+
+    #[test]
+    fn ctrl_backspace_deletes_the_word_before_the_caret() {
+        let mut app = BrowserApp::new(load_page(None));
+        app.address_text = "one two three".to_string();
+        app.address_cursor = app.address_text.len();
+        app.delete_word_backward();
+        assert_eq!(app.address_text, "one two ");
+        app.delete_word_backward();
+        assert_eq!(app.address_text, "one ");
+        app.delete_word_backward();
+        assert_eq!(app.address_text, "");
+    }
+
+    #[test]
+    fn ctrl_shift_backspace_clears_the_line_before_the_caret() {
+        let mut app = BrowserApp::new(load_page(None));
+        app.address_text = "hello world".to_string();
+        app.address_cursor = 6;
+        app.delete_to_line_start();
+        assert_eq!(app.address_text, "world");
+        assert_eq!(app.address_cursor, 0);
+    }
+
+    #[test]
+    fn ctrl_arrow_moves_by_word_and_shift_extends_the_selection() {
+        let mut app = BrowserApp::new(load_page(None));
+        app.address_text = "alpha beta gamma".to_string();
+        app.address_cursor = 0;
+        app.move_word(true, false);
+        assert_eq!(&app.address_text[..app.address_cursor], "alpha ");
+        app.move_word(true, false);
+        assert_eq!(&app.address_text[..app.address_cursor], "alpha beta ");
+
+        app.move_word(false, true);
+        assert!(app.selection_range().is_some());
+    }
+
+    #[test]
+    fn switch_tab_keeps_each_pages_state() {
         let mut app = BrowserApp::new(load_page(None));
         app.navigate_new("about:sample");
         app.new_tab();

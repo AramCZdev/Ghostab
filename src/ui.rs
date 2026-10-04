@@ -897,7 +897,21 @@ impl App {
         if let Some(modal) = &mut self.modal {
             match modal {
                 Modal::About { .. } | Modal::Shield { .. } => {
-                    if matches!(&input, KeyInput::Escape) {
+                    // Ctrl+Tab cycles the About pages, Escape closes it.
+                    if mods.ctrl && keysym == Some(KeySymChar::Tab) {
+                        let step: i16 = if mods.shift { -1 } else { 1 };
+                        let last = ABOUT_TAB_COUNT as i16 - 1;
+                        if let Some(Modal::About { tab }) = self.modal.as_mut() {
+                            let next = *tab as i16 + step;
+                            *tab = if next < 0 {
+                                last as u8
+                            } else if next > last {
+                                0
+                            } else {
+                                next as u8
+                            };
+                        }
+                    } else if matches!(&input, KeyInput::Escape) {
                         modal_action = Some(ModalAction::Close);
                     }
                 }
@@ -976,8 +990,15 @@ impl App {
             match &input {
                 KeyInput::Escape => self.app.address_focused = false,
                 KeyInput::Enter => self.app.navigate(),
+                KeyInput::Backspace if mods.ctrl && mods.shift => {
+                    self.app.delete_to_line_start()
+                }
+                KeyInput::Backspace if mods.ctrl => self.app.delete_word_backward(),
                 KeyInput::Backspace => self.app.delete_backward(),
                 KeyInput::Delete => self.app.delete_forward(),
+                // Ctrl+Left / Ctrl+Right step a word at a time in the bar.
+                KeyInput::Left if mods.ctrl => self.app.move_word(false, mods.shift),
+                KeyInput::Right if mods.ctrl => self.app.move_word(true, mods.shift),
                 KeyInput::Left => self.app.move_cursor(false, mods.shift),
                 KeyInput::Right => self.app.move_cursor(true, mods.shift),
                 KeyInput::Home => self.app.move_cursor_home(mods.shift),
@@ -997,14 +1018,29 @@ impl App {
             }
         } else if mods.ctrl {
             match keysym {
-                Some(KeySymChar::T) => self.app.new_tab(),
+                Some(KeySymChar::T) => {
+                    if mods.shift {
+                        self.app.reopen_closed_tab();
+                    } else {
+                        self.app.new_tab();
+                    }
+                }
                 Some(KeySymChar::W) => {
-                    if self.app.close_tab(self.app.active_tab) {
+                    if mods.shift || self.app.close_tab(self.app.active_tab) {
                         self.quit = true;
                     }
                 }
-                Some(KeySymChar::R) => self.app.reload(),
-                Some(KeySymChar::L) => {
+                Some(KeySymChar::R) => {
+                    self.app.reload();
+                    if mods.shift {
+                        self.app.address_focused = true;
+                        self.app.select_all();
+                    }
+                }
+                Some(KeySymChar::F5) => self.app.reload(),
+                // Ctrl+L, Ctrl+E and Ctrl+K all focus the address bar, as in
+                // every other browser.
+                Some(KeySymChar::L) | Some(KeySymChar::E) | Some(KeySymChar::K) => {
                     self.app.address_focused = true;
                     self.app.select_all();
                 }
@@ -1013,6 +1049,7 @@ impl App {
                         self.quit = true;
                     }
                 }
+                Some(KeySymChar::Q) => self.quit = true,
                 Some(KeySymChar::Tab) => {
                     if mods.shift {
                         self.app.prev_tab();
@@ -1020,15 +1057,58 @@ impl App {
                         self.app.next_tab();
                     }
                 }
+                Some(digit @ (KeySymChar::Digit1
+                | KeySymChar::Digit2
+                | KeySymChar::Digit3
+                | KeySymChar::Digit4
+                | KeySymChar::Digit5
+                | KeySymChar::Digit6
+                | KeySymChar::Digit7
+                | KeySymChar::Digit8
+                | KeySymChar::Digit9)) => {
+                    if let Some(index) = digit.tab_index() {
+                        self.app.switch_tab(index);
+                    }
+                }
+                _ => redraw = false,
+            }
+        } else if mods.alt {
+            // Alt+Left / Alt+Right navigate history without moving the caret,
+            // which is how browsers bind back and forward. Alt+Home opens the
+            // new tab page.
+            match &input {
+                KeyInput::Left => self.app.go_back(),
+                KeyInput::Right => self.app.go_forward(),
+                KeyInput::Home => self.app.navigate_to("ghostab:newpage"),
                 _ => redraw = false,
             }
         } else {
             match &input {
-                KeyInput::Escape => self.quit = true,
+                // Escape backs out of a focused address bar or stops a load
+                // before it falls through to quitting the window.
+                KeyInput::Escape => {
+                    if self.app.is_loading() {
+                        self.app.cancel_loading();
+                    } else if self.app.address_focused {
+                        self.app.address_focused = false;
+                    } else {
+                        self.quit = true;
+                    }
+                }
                 KeyInput::PageUp => self.app.scroll_by(-(self.app.viewport_height() as c_int)),
                 KeyInput::PageDown => self.app.scroll_by(self.app.viewport_height() as c_int),
                 KeyInput::Home => self.app.scroll_home(),
                 KeyInput::End => self.app.scroll_end(),
+                KeyInput::Up => self.app.scroll_by(-SCROLL_STEP),
+                KeyInput::Down => self.app.scroll_by(SCROLL_STEP),
+                // Space and Shift+Space page down/up, like every browser.
+                KeyInput::Text(text) if text == " " => {
+                    if mods.shift {
+                        self.app.scroll_by(-(self.app.viewport_height() as c_int));
+                    } else {
+                        self.app.scroll_by(self.app.viewport_height() as c_int);
+                    }
+                }
                 _ => redraw = false,
             }
         }
@@ -1150,6 +1230,7 @@ impl ApplicationHandler for App {
                 self.mods = KeyMods {
                     ctrl: state.control_key(),
                     shift: state.shift_key(),
+                    alt: state.alt_key(),
                 };
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -1808,6 +1889,39 @@ fn cursor_for_click(app: &BrowserApp, click_x: c_int) -> usize {
 
 const ABOUT_W: c_int = 520;
 const ABOUT_H: c_int = 240;
+
+/// How many pages the About dialog has (Shortcuts, Credits).
+const ABOUT_TAB_COUNT: u8 = 2;
+
+/// Shown in the About dialog so the bindings are discoverable.
+const SHORTCUT_LIST: [(&str, &str); 26] = [
+    ("Ctrl+T", "New tab"),
+    ("Ctrl+W", "Close tab"),
+    ("Ctrl+Shift+T", "Reopen closed tab"),
+    ("Ctrl+Shift+W", "Close window"),
+    ("Ctrl+Tab", "Next tab"),
+    ("Ctrl+Shift+Tab", "Previous tab"),
+    ("Ctrl+1..9", "Go to tab"),
+    ("Ctrl+L / E / K", "Focus address bar"),
+    ("Alt+Left", "Back"),
+    ("Alt+Right", "Forward"),
+    ("Alt+Home", "New tab page"),
+    ("Ctrl+R / F5", "Reload"),
+    ("Ctrl+Shift+R", "Reload and edit URL"),
+    ("Ctrl+Q", "Quit"),
+    ("Escape", "Stop loading / unfocus"),
+    ("Space / Shift+Space", "Page down / up"),
+    ("Up / Down", "Scroll"),
+    ("PageUp / PageDown", "Page up / down"),
+    ("Home / End", "Top / bottom"),
+    ("Ctrl+A / C / V", "Select, copy, paste"),
+    ("Ctrl+Backspace", "Delete word"),
+    ("Ctrl+Arrow", "Move by word"),
+    ("Ctrl+Shift+Backspace", "Delete line"),
+    ("Enter", "Go / activate link"),
+    ("Tab", "Next link"),
+    ("Esc (address bar)", "Cancel edit"),
+];
 const ABOUT_CLOSE_X: c_int = ABOUT_W - 16 - SETTINGS_OK_W;
 const ABOUT_CLOSE_Y: c_int = ABOUT_H - 42;
 
@@ -1817,12 +1931,18 @@ fn draw_about_content(tab: u8, canvas: &mut Canvas) {
     draw_about_tabs(tab, canvas);
     canvas.set_fg(pal(COLOR_BODY_TEXT));
     if tab == 0 {
-        canvas.text_baseline(28, 58, "Ghostab");
-        canvas.text_baseline(28, 82, "Engine: Ghost Engine 2.0.0-alpha");
-        canvas.text_baseline(28, 106, "A tiny experimental browser engine written in Rust.");
-        canvas.text_baseline(28, 130, "Networking: HTTP/HTTPS loading through curl.");
-        canvas.text_baseline(28, 154, "Rendering: simplified HTML text layout in a winit window.");
-        canvas.text_baseline(28, 178, "Privacy: clipboard is app-only and never touches the OS.");
+        canvas.text_baseline(28, 58, "Keyboard Shortcuts");
+        // Two columns so the whole list fits above the Close button.
+        for (i, (keys, action)) in SHORTCUT_LIST.iter().enumerate() {
+            let column = i / 13;
+            let row = i % 13;
+            let x = 28 + (column * 250) as c_int;
+            let y = 88 + (row as c_int) * 20;
+            canvas.set_fg(pal(COLOR_LINK));
+            canvas.text_baseline(x, y, keys);
+            canvas.set_fg(pal(COLOR_BODY_TEXT));
+            canvas.text_baseline(x + 108, y, action);
+        }
     } else {
         canvas.text_baseline(28, 58, "Credits");
         canvas.text_baseline(28, 82, "Made by AramCZ");
@@ -2061,6 +2181,8 @@ enum KeyInput {
     End,
     Left,
     Right,
+    Up,
+    Down,
     Text(String),
     Other,
 }
@@ -2078,6 +2200,8 @@ fn log_input(input: &KeyInput) -> String {
         KeyInput::End => "End".into(),
         KeyInput::Left => "Left".into(),
         KeyInput::Right => "Right".into(),
+        KeyInput::Up => "Up".into(),
+        KeyInput::Down => "Down".into(),
         KeyInput::Other => "Other".into(),
     }
 }
@@ -2086,19 +2210,63 @@ fn log_input(input: &KeyInput) -> String {
 struct KeyMods {
     ctrl: bool,
     shift: bool,
+    alt: bool,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+impl KeySymChar {
+    /// Ctrl+1..Ctrl+9 jump to a tab by position, so map the digit to an index.
+    fn tab_index(self) -> Option<usize> {
+        let n = match self {
+            KeySymChar::Digit1 => 1,
+            KeySymChar::Digit2 => 2,
+            KeySymChar::Digit3 => 3,
+            KeySymChar::Digit4 => 4,
+            KeySymChar::Digit5 => 5,
+            KeySymChar::Digit6 => 6,
+            KeySymChar::Digit7 => 7,
+            KeySymChar::Digit8 => 8,
+            KeySymChar::Digit9 => 9,
+            _ => return None,
+        };
+        Some(n - 1)
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum KeySymChar {
     A,
     C,
     D,
+    E,
+    F,
+    H,
+    I,
+    J,
+    K,
     L,
+    N,
+    O,
+    P,
+    Q,
     R,
     T,
+    U,
     V,
     W,
+    Y,
     Tab,
+    Digit1,
+    Digit2,
+    Digit3,
+    Digit4,
+    Digit5,
+    Digit6,
+    Digit7,
+    Digit8,
+    Digit9,
+    Equal,
+    Minus,
+    F5,
 }
 
 fn physical_char(code: KeyCode) -> Option<KeySymChar> {
@@ -2107,11 +2275,35 @@ fn physical_char(code: KeyCode) -> Option<KeySymChar> {
         KeyA => KeySymChar::A,
         KeyC => KeySymChar::C,
         KeyD => KeySymChar::D,
+        KeyE => KeySymChar::E,
+        KeyF => KeySymChar::F,
+        KeyH => KeySymChar::H,
+        KeyI => KeySymChar::I,
+        KeyJ => KeySymChar::J,
+        KeyK => KeySymChar::K,
         KeyL => KeySymChar::L,
+        KeyN => KeySymChar::N,
+        KeyO => KeySymChar::O,
+        KeyP => KeySymChar::P,
+        KeyQ => KeySymChar::Q,
         KeyR => KeySymChar::R,
         KeyT => KeySymChar::T,
+        KeyU => KeySymChar::U,
         KeyV => KeySymChar::V,
         KeyW => KeySymChar::W,
+        KeyY => KeySymChar::Y,
+        Digit1 => KeySymChar::Digit1,
+        Digit2 => KeySymChar::Digit2,
+        Digit3 => KeySymChar::Digit3,
+        Digit4 => KeySymChar::Digit4,
+        Digit5 => KeySymChar::Digit5,
+        Digit6 => KeySymChar::Digit6,
+        Digit7 => KeySymChar::Digit7,
+        Digit8 => KeySymChar::Digit8,
+        Digit9 => KeySymChar::Digit9,
+        Equal | NumpadAdd => KeySymChar::Equal,
+        Minus | NumpadSubtract => KeySymChar::Minus,
+        F5 => KeySymChar::F5,
         _ => return None,
     })
 }
@@ -2138,6 +2330,8 @@ fn read_key_event(event: &KeyEvent, mods: KeyMods) -> (KeyInput, KeyMods, Option
         Key::Named(NamedKey::End) => KeyInput::End,
         Key::Named(NamedKey::ArrowLeft) => KeyInput::Left,
         Key::Named(NamedKey::ArrowRight) => KeyInput::Right,
+        Key::Named(NamedKey::ArrowUp) => KeyInput::Up,
+        Key::Named(NamedKey::ArrowDown) => KeyInput::Down,
         _ => {
             if let Some(text) = &event.text {
                 if !text.is_empty() && text.chars().all(|ch| !ch.is_control()) {
