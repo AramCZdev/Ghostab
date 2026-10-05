@@ -5,7 +5,9 @@ use std::os::raw::c_int;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cosmic_text::{Attrs, Color, Family, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{
+    Attrs, Color, Family, FontSystem, Metrics, Shaping, Style as FontStyle, SwashCache, Weight,
+};
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -52,6 +54,22 @@ struct FontState {
     cache: SwashCache,
 }
 
+/// Font attributes for a run of laid-out text. `Family::Monospace` is a
+/// fontdb alias, so it resolves to whatever monospace font is installed.
+fn styled_attrs(style: engine::TextStyle) -> Attrs<'static> {
+    let mut attrs = Attrs::new();
+    if style.mono {
+        attrs = attrs.family(Family::Monospace);
+    }
+    if style.bold {
+        attrs = attrs.weight(Weight::BOLD);
+    }
+    if style.italic {
+        attrs = attrs.style(FontStyle::Italic);
+    }
+    attrs
+}
+
 fn with_font_state<T>(f: impl FnOnce(&mut FontState) -> T) -> T {
     let mut guard = FONT_STATE.lock().unwrap();
     if guard.is_none() {
@@ -75,8 +93,23 @@ impl FontState {
     }
 
     fn shape(&mut self, text: &str, width: f32, height: f32) {
-        let default_attrs = Attrs::new();
-        let emoji_attrs = Attrs::new().family(Family::Name(emoji_font_name()));
+        self.shape_styled(text, width, height, engine::TextStyle::default());
+    }
+
+    /// Shape `text` with the emphasis the layout engine resolved for it.
+    /// Underline and strikethrough are drawn by the caller instead, so they
+    /// line up with the cell grid rather than the font's own metrics.
+    fn shape_styled(
+        &mut self,
+        text: &str,
+        width: f32,
+        height: f32,
+        style: engine::TextStyle,
+    ) {
+        let default_attrs = styled_attrs(style);
+        let emoji_attrs = default_attrs
+            .clone()
+            .family(Family::Name(emoji_font_name()));
 
         let mut spans: Vec<(&str, Attrs)> = Vec::new();
         let mut run_start = 0;
@@ -339,6 +372,16 @@ impl<'a> Canvas<'a> {
     }
 
     pub fn text_baseline(&mut self, x: c_int, baseline: c_int, text: &str) {
+        self.text_baseline_styled(x, baseline, text, engine::TextStyle::default());
+    }
+
+    pub fn text_baseline_styled(
+        &mut self,
+        x: c_int,
+        baseline: c_int,
+        text: &str,
+        style: engine::TextStyle,
+    ) {
         if text.is_empty() {
             return;
         }
@@ -349,7 +392,7 @@ impl<'a> Canvas<'a> {
         let origin_y = self.origin_y;
         let mut pixel_spans: Vec<(c_int, c_int, Color)> = Vec::new();
         with_font_state(|state| {
-            state.shape(text, 10000.0, canvas_height as f32);
+            state.shape_styled(text, 10000.0, canvas_height as f32, style);
             for run in state.buffer.lines[0].layout_runs(Some(10000.0), state.metrics.line_height) {
                 for glyph in run.glyphs {
                     let physical = glyph.physical((0.0, baseline as f32), 1.0);
@@ -1676,15 +1719,20 @@ fn draw_box(
             && y <= window_height - STATUS_BAR_HEIGHT as c_int - 10
         {
             if !node.links.is_empty() {
-                draw_text_with_links(canvas, x, y, text, &node.links);
-            } else if node.href.is_some() {
-                canvas.set_fg(pal(COLOR_LINK));
-                canvas.text_baseline(x, y, text);
-                let pw = text_width(text);
-                canvas.line(x, y + 2, x + pw, y + 2);
+                draw_text_with_links(canvas, x, y, text, &node.links, node.style);
             } else {
-                canvas.set_fg(pal(COLOR_BODY_TEXT));
-                canvas.text_baseline(x, y, text);
+                let color = if node.href.is_some() {
+                    pal(COLOR_LINK)
+                } else {
+                    pal(COLOR_BODY_TEXT)
+                };
+                canvas.set_fg(color);
+                canvas.text_baseline_styled(x, y, text, node.style);
+                let width = text_width(text);
+                if node.href.is_some() {
+                    canvas.line(x, y + 2, x + width, y + 2);
+                }
+                draw_decorations(canvas, x, y, width, node.style);
             }
         }
     }
@@ -1730,12 +1778,33 @@ fn draw_box(
     }
 }
 
+/// Draw the underline and strikethrough the layout engine asked for. Both use
+/// the same vertical offsets as the link underline so mixed text stays even.
+fn draw_decorations(
+    canvas: &mut Canvas,
+    x: c_int,
+    baseline: c_int,
+    width: c_int,
+    style: engine::TextStyle,
+) {
+    if width <= 0 {
+        return;
+    }
+    if style.underline {
+        canvas.line(x, baseline + 2, x + width, baseline + 2);
+    }
+    if style.strike {
+        canvas.line(x, baseline - 4, x + width, baseline - 4);
+    }
+}
+
 fn draw_text_with_links(
     canvas: &mut Canvas,
     x: c_int,
     y: c_int,
     text: &str,
     links: &[engine::LinkSpan],
+    style: engine::TextStyle,
 ) {
     let mut cx = x;
     let mut prev = 0usize;
@@ -1744,14 +1813,17 @@ fn draw_text_with_links(
             if span.start > prev {
                 let segment = &text[prev..span.start];
                 canvas.set_fg(pal(COLOR_BODY_TEXT));
-                canvas.text_baseline(cx, y, segment);
-                cx += text_width(segment);
+                canvas.text_baseline_styled(cx, y, segment, style);
+                let pw = text_width(segment);
+                draw_decorations(canvas, cx, y, pw, style);
+                cx += pw;
             }
             let segment = &text[span.start..span.end];
             canvas.set_fg(pal(COLOR_LINK));
-            canvas.text_baseline(cx, y, segment);
+            canvas.text_baseline_styled(cx, y, segment, style);
             let pw = text_width(segment);
             canvas.line(cx, y + 2, cx + pw, y + 2);
+            draw_decorations(canvas, cx, y, pw, style);
             cx += pw;
             prev = span.end;
         }
@@ -1759,7 +1831,9 @@ fn draw_text_with_links(
     if prev < text.len() {
         let segment = &text[prev..];
         canvas.set_fg(pal(COLOR_BODY_TEXT));
-        canvas.text_baseline(cx, y, segment);
+        canvas.text_baseline_styled(cx, y, segment, style);
+        let pw = text_width(segment);
+        draw_decorations(canvas, cx, y, pw, style);
     }
 }
 

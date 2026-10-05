@@ -9,19 +9,24 @@ pub fn parse_html(source: &str) -> Document {
 struct Parser<'a> {
     input: &'a str,
     position: usize,
+    /// Depth of open <pre>/<textarea> elements. Inside them, whitespace is
+    /// significant and must survive instead of being collapsed.
+    preformatted: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(input: &'a str) -> Self {
-        Self { input, position: 0 }
+        Self {
+            input,
+            position: 0,
+            preformatted: 0,
+        }
     }
 
     fn parse_nodes(&mut self, closing_tag: Option<&str>) -> Vec<Node> {
         let mut nodes = Vec::new();
 
         while !self.eof() {
-            self.consume_whitespace();
-
             if self.starts_with("<!--") {
                 self.consume_comment();
                 continue;
@@ -50,7 +55,9 @@ impl<'a> Parser<'a> {
                 self.parse_text()
             };
 
-            if !is_empty_text(&node) {
+            // Whitespace between elements is kept: collapsed to one space it
+            // still separates inline content, and block layout ignores it.
+            if !is_empty_text(&node) || is_text(&node) {
                 nodes.push(node);
             }
         }
@@ -79,7 +86,14 @@ impl<'a> Parser<'a> {
         } else if is_void_element(&tag_name) {
             Vec::new()
         } else {
-            self.parse_nodes(Some(&tag_name))
+            if is_preformatted_element(&tag_name) {
+                self.preformatted += 1;
+            }
+            let children = self.parse_nodes(Some(&tag_name));
+            if is_preformatted_element(&tag_name) {
+                self.preformatted = self.preformatted.saturating_sub(1);
+            }
+            children
         };
 
         Node::element_with_attributes(tag_name, attributes, children)
@@ -135,7 +149,12 @@ impl<'a> Parser<'a> {
 
     fn parse_text(&mut self) -> Node {
         let text = self.consume_while(|ch| ch != '<');
-        Node::text(collapse_whitespace(&decode_entities(&text)))
+        // Inside <pre>, runs of spaces and newlines are meaningful.
+        if self.preformatted > 0 {
+            Node::text(decode_entities(&text))
+        } else {
+            Node::text(collapse_whitespace(&decode_entities(&text)))
+        }
     }
 
     fn consume_closing_tag(&mut self) -> String {
@@ -228,6 +247,15 @@ fn is_empty_text(node: &Node) -> bool {
     matches!(&node.kind, NodeKind::Text(text) if text.trim().is_empty())
 }
 
+fn is_text(node: &Node) -> bool {
+    matches!(&node.kind, NodeKind::Text(_))
+}
+
+/// Elements whose whitespace is significant.
+fn is_preformatted_element(tag_name: &str) -> bool {
+    matches!(tag_name, "pre" | "textarea" | "listing" | "plaintext")
+}
+
 fn is_void_element(tag_name: &str) -> bool {
     matches!(
         tag_name,
@@ -241,15 +269,151 @@ fn is_ignored_content_element(tag_name: &str) -> bool {
 }
 
 fn collapse_whitespace(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    // Runs of whitespace become one space, but a space that touched either end
+    // of the text node has to survive: it is the only thing separating
+    // `plain <b>bold</b>` or marking that `</a>` was followed by a space.
+    if text.trim().is_empty() {
+        return if text.is_empty() {
+            String::new()
+        } else {
+            " ".to_string()
+        };
+    }
+    let mut out = String::new();
+    if text.starts_with(char::is_whitespace) {
+        out.push(' ');
+    }
+    out.push_str(&text.split_whitespace().collect::<Vec<_>>().join(" "));
+    if text.ends_with(char::is_whitespace) {
+        out.push(' ');
+    }
+    out
 }
 
 fn decode_entities(text: &str) -> String {
-    text.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&amp;", "&")
+    if !text.contains('&') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        match decode_one_entity(rest) {
+            Some((ch, len)) => {
+                out.push(ch);
+                rest = &rest[len..];
+            }
+            // A bare '&' that starts nothing valid stays literal.
+            None => {
+                out.push('&');
+                rest = &rest['&'.len_utf8()..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Decode one entity starting at `text` (which begins with '&').
+/// Returns the character and how many bytes to skip, or None if invalid.
+fn decode_one_entity(text: &str) -> Option<(char, usize)> {
+    // Entities are short in practice; cap the scan so stray '&' followed by
+    // lots of prose is not rescanned repeatedly.
+    let limit = text.len().min(34);
+    let body_end = text[..limit].find(';')?;
+    let body = &text[1..body_end];
+    let total = body_end + 1;
+
+    // Numeric: &#1234; or &#x1F600;
+    if let Some(digits) = body.strip_prefix('#') {
+        let code = if let Some(hex) = digits.strip_prefix('x').or_else(|| digits.strip_prefix('X')) {
+            if hex.is_empty() {
+                return None;
+            }
+            u32::from_str_radix(hex, 16).ok()?
+        } else {
+            if digits.is_empty() {
+                return None;
+            }
+            digits.parse::<u32>().ok()?
+        };
+        // Reject out-of-range and surrogate values rather than emitting junk.
+        let ch = char::from_u32(code).filter(|c| !is_surrogate(*c))?;
+        return Some((ch, total));
+    }
+
+    let ch = named_entity(body)?;
+    Some((ch, total))
+}
+
+fn is_surrogate(ch: char) -> bool {
+    let code = ch as u32;
+    (0xD800..=0xDFFF).contains(&code)
+}
+
+/// The common named entities. Rendering a space for &nbsp; rather than U+00A0
+/// keeps widths predictable in a monospace grid.
+fn named_entity(name: &str) -> Option<char> {
+    let ch = match name {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        "nbsp" => ' ',
+        "ensp" | "emsp" | "thinsp" => ' ',
+        "copy" => '\u{a9}',
+        "reg" => '\u{ae}',
+        "trade" => '\u{2122}',
+        "hellip" => '\u{2026}',
+        "mdash" => '\u{2014}',
+        "ndash" => '\u{2013}',
+        "lsquo" => '\u{2018}',
+        "rsquo" => '\u{2019}',
+        "ldquo" => '\u{201c}',
+        "rdquo" => '\u{201d}',
+        "sbquo" => '\u{201a}',
+        "bdquo" => '\u{201e}',
+        "prime" => '\u{2032}',
+        "Prime" => '\u{2033}',
+        "bull" => '\u{2022}',
+        "middot" => '\u{b7}',
+        "deg" => '\u{b0}',
+        "plusmn" => '\u{b1}',
+        "times" => '\u{d7}',
+        "divide" => '\u{f7}',
+        "frac12" => '\u{bd}',
+        "frac14" => '\u{bc}',
+        "frac34" => '\u{be}',
+        "laquo" => '\u{ab}',
+        "raquo" => '\u{bb}',
+        "euro" => '\u{20ac}',
+        "pound" => '\u{a3}',
+        "yen" => '\u{a5}',
+        "cent" => '\u{a2}',
+        "sect" => '\u{a7}',
+        "para" => '\u{b6}',
+        "dagger" => '\u{2020}',
+        "larr" | "leftarrow" => '\u{2190}',
+        "rarr" | "rightarrow" => '\u{2192}',
+        "harr" | "leftrightarrow" => '\u{2194}',
+        "lArr" | "Leftarrow" => '\u{21d0}',
+        "rArr" | "Rightarrow" => '\u{21d2}',
+        "ne" => '\u{2260}',
+        "le" | "leq" => '\u{2264}',
+        "ge" | "geq" => '\u{2265}',
+        "sim" => '\u{223c}',
+        "infin" => '\u{221e}',
+        "micro" => '\u{b5}',
+        "sup2" => '\u{b2}',
+        "sup3" => '\u{b3}',
+        "frac13" => '\u{2153}',
+        "frac23" => '\u{2154}',
+        "permil" | "pertenk" => '\u{2030}',
+        _ => return None,
+    };
+    Some(ch)
 }
 
 #[cfg(test)]
@@ -295,5 +459,28 @@ mod tests {
         } else {
             panic!("expected element");
         }
+    }
+
+    #[test]
+    fn decodes_named_entities() {
+        assert_eq!(named_entity("amp"), Some('&'));
+        assert_eq!(named_entity("mdash"), Some('\u{2014}'));
+        assert_eq!(named_entity("hellip"), Some('\u{2026}'));
+        assert_eq!(named_entity("nope"), None);
+    }
+
+    #[test]
+    fn curly_quotes_are_distinct() {
+        assert_eq!(named_entity("lsquo"), Some('\u{2018}'));
+        assert_eq!(named_entity("rsquo"), Some('\u{2019}'));
+        assert_eq!(named_entity("ldquo"), Some('\u{201c}'));
+        assert_eq!(named_entity("rdquo"), Some('\u{201d}'));
+    }
+
+    #[test]
+    fn decodes_numeric_entities() {
+        assert_eq!(named_entity("ne"), Some('\u{2260}'));
+        assert_eq!(decode_one_entity("&#8212;rest"), Some(('\u{2014}', 7)));
+        assert_eq!(decode_one_entity("&#x2014;rest"), Some(('\u{2014}', 8)));
     }
 }

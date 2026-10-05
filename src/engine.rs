@@ -4,4 +4,6 @@ pub mod layout;
 
 pub use dom::Document;
 pub use html::parse_html;
-pub use layout::{layout_document, ImageSpec, LayoutBox, LinkSpan, Rect, Viewport};
+pub use layout::{
+    layout_document, ImageSpec, LayoutBox, LinkSpan, Rect, TextStyle, Viewport,
+};

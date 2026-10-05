@@ -422,6 +422,7 @@ impl BrowserApp {
                 links: Vec::new(),
                 image: None,
                 rule: false,
+                style: engine::TextStyle::default(),
                 children: Vec::new(),
             },
             images: ImageCache::default(),
