@@ -1,3 +1,15 @@
+ghostab (3.0.0-alpha) unstable; urgency=medium
+
+  * RightDao replaces DuckDuckGo as the default search engine.
+  * Browser-style keyboard shortcuts, closed-tab reopening, and Escape to
+    cancel a page load.
+  * Lists, tables, preformatted blocks, inline emphasis, definition lists,
+    and an expanded set of HTML entities.
+  * Emoji-aware text shaping with correct Unicode display widths.
+  * Loading indicator, realistic request headers, and a persistent cookie jar.
+
+ -- AramCZ <aramcz@protonmail.com>  Mon, 05 Oct 2026 00:00:00 +0000
+
 ghostab (2.0.0-alpha) unstable; urgency=medium
 
   * New winit-based UI, app-only clipboard, text-only connection popups.
