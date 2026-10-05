@@ -633,7 +633,7 @@ impl App {
                 canvas.with_origin(mx, my, |c| {
                     draw_about_content(*tab, c);
                     c.set_fg(pal(COLOR_PAGE_BORDER));
-                    c.rect(0, 0, 520, 240);
+                    c.rect(0, 0, ABOUT_W, ABOUT_H);
                 });
             }
             Some(Modal::Settings {
@@ -1961,11 +1961,25 @@ fn cursor_for_click(app: &BrowserApp, click_x: c_int) -> usize {
     start + best
 }
 
-const ABOUT_W: c_int = 520;
-const ABOUT_H: c_int = 240;
+const ABOUT_W: c_int = 720;
+const ABOUT_H: c_int = 460;
 
-/// How many pages the About dialog has (Shortcuts, Credits).
-const ABOUT_TAB_COUNT: u8 = 2;
+/// How many pages the About dialog has (About, Shortcuts, Credits).
+const ABOUT_TAB_COUNT: u8 = 3;
+const ABOUT_TAB_LABELS: [&str; ABOUT_TAB_COUNT as usize] = ["About", "Shortcuts", "Credits"];
+const ABOUT_TAB_W: c_int = 96;
+const ABOUT_TAB_STRIDE: c_int = 104;
+const ABOUT_TAB_X: c_int = 12;
+
+/// Shortcut list geometry. Two columns of thirteen, sized so the widest key
+/// ("Ctrl+Shift+Backspace") never reaches the action text and the last row
+/// stays clear of the divider above the Close button.
+const ABOUT_LIST_X: c_int = 24;
+const ABOUT_LIST_KEY_GAP: c_int = 152;
+const ABOUT_LIST_COL_STRIDE: c_int = 360;
+const ABOUT_LIST_ROWS: usize = 13;
+const ABOUT_LIST_TOP: c_int = 88;
+const ABOUT_LIST_ROW_H: c_int = 20;
 
 /// Shown in the About dialog so the bindings are discoverable.
 const SHORTCUT_LIST: [(&str, &str); 26] = [
@@ -2003,21 +2017,43 @@ fn draw_about_content(tab: u8, canvas: &mut Canvas) {
     canvas.set_fg(pal(COLOR_PAGE));
     canvas.fill_rect(0, 0, ABOUT_W, ABOUT_H);
     draw_about_tabs(tab, canvas);
-    canvas.set_fg(pal(COLOR_BODY_TEXT));
     if tab == 0 {
+        canvas.set_fg(pal(COLOR_BODY_TEXT));
+        canvas.text_baseline(28, 58, "About Ghostab");
+        for (i, (label, value)) in [
+            ("Ghostab", env!("CARGO_PKG_VERSION")),
+            ("Ghost engine", engine::ENGINE_VERSION),
+            ("License", "GPL-3.0"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let y = 96 + (i as c_int) * 28;
+            canvas.set_fg(pal(COLOR_LINK));
+            canvas.text_baseline(28, y, label);
+            canvas.set_fg(pal(COLOR_BODY_TEXT));
+            canvas.text_baseline(200, y, value);
+        }
+        canvas.set_fg(pal(COLOR_MUTED_TEXT));
+        canvas.text_baseline(28, 212, "A tiny experimental browser engine written in Rust.");
+        canvas.text_baseline(28, 236, "Pages are parsed and laid out by Ghost itself;");
+        canvas.text_baseline(28, 260, "no JavaScript is executed.");
+    } else if tab == 1 {
+        canvas.set_fg(pal(COLOR_BODY_TEXT));
         canvas.text_baseline(28, 58, "Keyboard Shortcuts");
         // Two columns so the whole list fits above the Close button.
         for (i, (keys, action)) in SHORTCUT_LIST.iter().enumerate() {
-            let column = i / 13;
-            let row = i % 13;
-            let x = 28 + (column * 250) as c_int;
-            let y = 88 + (row as c_int) * 20;
+            let column = (i / ABOUT_LIST_ROWS) as c_int;
+            let row = (i % ABOUT_LIST_ROWS) as c_int;
+            let x = ABOUT_LIST_X + column * ABOUT_LIST_COL_STRIDE;
+            let y = ABOUT_LIST_TOP + row * ABOUT_LIST_ROW_H;
             canvas.set_fg(pal(COLOR_LINK));
             canvas.text_baseline(x, y, keys);
             canvas.set_fg(pal(COLOR_BODY_TEXT));
-            canvas.text_baseline(x + 108, y, action);
+            canvas.text_baseline(x + ABOUT_LIST_KEY_GAP, y, action);
         }
     } else {
+        canvas.set_fg(pal(COLOR_BODY_TEXT));
         canvas.text_baseline(28, 58, "Credits");
         canvas.text_baseline(28, 82, "Made by AramCZ");
         canvas.text_baseline(28, 106, "Tools: Rust, C (curl), winit, softbuffer, cosmic-text,");
@@ -2038,18 +2074,18 @@ fn draw_about_content(tab: u8, canvas: &mut Canvas) {
 }
 
 fn draw_about_tabs(active: u8, canvas: &mut Canvas) {
-    for (i, label) in ["About", "Credits"].iter().enumerate() {
+    for (i, label) in ABOUT_TAB_LABELS.iter().enumerate() {
         let i = i as u8;
-        let x = 12 + (i as c_int) * 104;
+        let x = ABOUT_TAB_X + (i as c_int) * ABOUT_TAB_STRIDE;
         let selected = i == active;
         canvas.set_fg(pal(if selected {
             COLOR_SURFACE
         } else {
             COLOR_BUTTON_BG
         }));
-        canvas.fill_rect(x, 4, 96, 28);
+        canvas.fill_rect(x, 4, ABOUT_TAB_W, 28);
         canvas.set_fg(pal(COLOR_PAGE_BORDER));
-        canvas.rect(x, 4, 96, 28);
+        canvas.rect(x, 4, ABOUT_TAB_W, 28);
         canvas.set_fg(pal(if selected {
             COLOR_BODY_TEXT
         } else {
@@ -2058,20 +2094,20 @@ fn draw_about_tabs(active: u8, canvas: &mut Canvas) {
         canvas.text_centered(x + 14, 4, 28, label);
     }
     canvas.set_fg(pal(COLOR_PAGE_BORDER));
-    canvas.line(0, 32, 520, 32);
+    canvas.line(0, 32, ABOUT_W, 32);
 }
 
 fn about_tab_at(x: c_int, y: c_int) -> Option<u8> {
     if !(4..=32).contains(&y) {
         return None;
     }
-    if (12..108).contains(&x) {
-        Some(0)
-    } else if (116..212).contains(&x) {
-        Some(1)
-    } else {
-        None
+    for i in 0..ABOUT_TAB_COUNT as c_int {
+        let left = ABOUT_TAB_X + i * ABOUT_TAB_STRIDE;
+        if (left..left + ABOUT_TAB_W).contains(&x) {
+            return Some(i as u8);
+        }
     }
+    None
 }
 
 fn about_close_at(x: c_int, y: c_int) -> bool {
@@ -2419,4 +2455,64 @@ fn read_key_event(event: &KeyEvent, mods: KeyMods) -> (KeyInput, KeyMods, Option
         }
     };
     (input, mods, keysym)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shortcut list used to run past the bottom and the right edge of the
+    /// dialog, so both edges are checked against the real shaped text.
+    #[test]
+    fn about_shortcut_list_stays_inside_the_dialog() {
+        for (keys, action) in SHORTCUT_LIST {
+            assert!(
+                text_width(keys) <= ABOUT_LIST_KEY_GAP - 8,
+                "{keys} is too wide and runs into the action column"
+            );
+            for column in 0..2 {
+                let x = ABOUT_LIST_X + column * ABOUT_LIST_COL_STRIDE;
+                assert!(
+                    x + ABOUT_LIST_KEY_GAP + text_width(action) <= ABOUT_W - 16,
+                    "{action} runs past the right edge of the About window"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn about_shortcut_rows_clear_the_close_button() {
+        let last_row = ABOUT_LIST_TOP + (ABOUT_LIST_ROWS as c_int - 1) * ABOUT_LIST_ROW_H;
+        let divider = ABOUT_H - 52;
+        assert!(
+            last_row < divider,
+            "the last shortcut row at {last_row} hits the divider at {divider}"
+        );
+    }
+
+    #[test]
+    fn about_columns_hold_every_shortcut() {
+        assert_eq!(SHORTCUT_LIST.len(), ABOUT_LIST_ROWS * 2);
+    }
+
+    #[test]
+    fn about_tab_strips_are_all_clickable() {
+        for i in 0..ABOUT_TAB_COUNT as c_int {
+            let left = ABOUT_TAB_X + i * ABOUT_TAB_STRIDE;
+            assert_eq!(about_tab_at(left + 4, 10), Some(i as u8));
+        }
+        // Below the strip and left of the first tab are not tabs.
+        assert_eq!(about_tab_at(ABOUT_TAB_X + 4, 100), None);
+        assert_eq!(about_tab_at(4, 10), None);
+    }
+
+    /// Every binding gets its own row: two columns of thirteen for 26 entries.
+    #[test]
+    fn shortcut_list_has_no_duplicates() {
+        let mut seen: Vec<&str> = SHORTCUT_LIST.iter().map(|(keys, _)| *keys).collect();
+        seen.sort_unstable();
+        let count = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), count, "duplicate shortcut in the About window");
+    }
 }
