@@ -528,11 +528,23 @@ enum Modal {
     About {
         tab: u8,
     },
+    Update {
+        headline: &'static str,
+        paragraphs: Vec<String>,
+        /// Set when a newer release exists; draws the Download button.
+        download_url: Option<&'static str>,
+    },
 }
 
 struct App {
     app: BrowserApp,
     modal: Option<Modal>,
+    /// The launch-time update check is started once, after the first frame.
+    update_checked: bool,
+    /// In-flight update check plus whether the user asked for it from the menu.
+    update_check: Option<(std::sync::mpsc::Receiver<UpdateOutcome>, bool)>,
+    /// Set when the user dismisses the update dialog before a check finishes.
+    update_dismissed: bool,
     quit: bool,
     mods: KeyMods,
     window: Option<Arc<Window>>,
@@ -547,6 +559,9 @@ pub fn run_window(app: BrowserApp) {
     let mut handler = App {
         app,
         modal: None,
+        update_checked: false,
+        update_check: None,
+        update_dismissed: false,
         quit: false,
         mods: KeyMods::default(),
         window: None,
@@ -612,6 +627,7 @@ impl App {
         let about_origin = self.modal_origin(ABOUT_W, ABOUT_H);
         let settings_origin = self.modal_origin(SETTINGS_W, SETTINGS_H);
         let shield_origin = self.modal_origin(SHIELD_W, SHIELD_H);
+        let update_origin = self.modal_origin(UPDATE_W, UPDATE_H);
         let Some(surface) = &mut self.surface else {
             return;
         };
@@ -660,6 +676,20 @@ impl App {
                     c.rect(0, 0, SHIELD_W, SHIELD_H);
                 });
             }
+            Some(Modal::Update {
+                headline,
+                paragraphs,
+                download_url,
+            }) => {
+                draw_browser(&self.app, &mut canvas);
+                canvas.dim(120);
+                let (mx, my) = update_origin;
+                canvas.with_origin(mx, my, |c| {
+                    draw_update_content(headline, paragraphs, *download_url, c);
+                    c.set_fg(pal(COLOR_PAGE_BORDER));
+                    c.rect(0, 0, UPDATE_W, UPDATE_H);
+                });
+            }
             None => draw_browser(&self.app, &mut canvas),
         }
         let _ = buffer.present();
@@ -672,8 +702,10 @@ impl App {
         );
         let mut modal_close_save: Option<Settings> = None;
         let mut modal_close = false;
+        let mut open_download: Option<&'static str> = None;
         let about_origin = self.modal_origin(ABOUT_W, ABOUT_H);
         let settings_origin = self.modal_origin(SETTINGS_W, SETTINGS_H);
+        let update_origin = self.modal_origin(UPDATE_W, UPDATE_H);
         match &mut self.modal {
             Some(Modal::About { tab }) => {
                 let (mx, my) = about_origin;
@@ -719,7 +751,21 @@ impl App {
             Some(Modal::Shield { .. }) => {
                 modal_close = true;
             }
+            Some(Modal::Update { download_url, .. }) => {
+                let (mx, my) = update_origin;
+                let (lx, ly) = (x - mx, y - my);
+                if lx < 0 || ly < 0 || lx >= UPDATE_W || ly >= UPDATE_H || update_close_at(lx, ly)
+                {
+                    modal_close = true;
+                } else if download_url.is_some() && update_download_at(lx, ly) {
+                    open_download = *download_url;
+                    modal_close = true;
+                }
+            }
             None => {}
+        }
+        if let Some(url) = open_download {
+            let _ = open_external(url);
         }
         if modal_close {
             if let Some(settings) = modal_close_save {
@@ -798,6 +844,18 @@ impl App {
                     MenuAction::ScrollBottom => app.scroll_end(),
                     MenuAction::About => {
                         self.modal = Some(Modal::About { tab: 0 });
+                    }
+                    MenuAction::CheckUpdates => {
+                        self.update_dismissed = false;
+                        self.update_check = Some((spawn_update_check(), true));
+                        self.modal = Some(Modal::Update {
+                            headline: "Checking for updates\u{2026}",
+                            paragraphs: vec![
+                                "Contacting aramcz.is-a.dev for the latest version\u{2026}"
+                                    .to_string(),
+                            ],
+                            download_url: None,
+                        });
                     }
                     MenuAction::None => {}
                 }
@@ -955,6 +1013,11 @@ impl App {
                             };
                         }
                     } else if matches!(&input, KeyInput::Escape) {
+                        modal_action = Some(ModalAction::Close);
+                    }
+                }
+                Modal::Update { .. } => {
+                    if matches!(&input, KeyInput::Escape) {
                         modal_action = Some(ModalAction::Close);
                     }
                 }
@@ -1303,6 +1366,46 @@ impl ApplicationHandler for App {
             event_loop.set_control_flow(ControlFlow::Poll);
             self.redraw();
             return;
+        }
+
+        // Start the launch update check once, after the first frame, on a
+        // worker thread. At launch only an available update announces itself;
+        // up-to-date and failed checks stay quiet unless the user asks from the
+        // Help menu. While the check is in flight, poll so its result is picked
+        // up promptly.
+        if !self.update_checked && self.window.is_some() {
+            self.update_checked = true;
+            self.update_check = Some((spawn_update_check(), false));
+        }
+        if let Some((manual, result)) = self
+            .update_check
+            .as_ref()
+            .map(|(receiver, manual)| (*manual, receiver.try_recv()))
+        {
+            match result {
+                Ok(outcome) => {
+                    self.update_check = None;
+                    let announce =
+                        manual || matches!(outcome, UpdateOutcome::Available { .. });
+                    if announce && !self.update_dismissed {
+                        self.modal = Some(Modal::Update {
+                            headline: outcome.headline(),
+                            paragraphs: outcome.paragraphs(),
+                            download_url: outcome.download_url(),
+                        });
+                        self.redraw();
+                    }
+                    self.update_dismissed = false;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    event_loop.set_control_flow(ControlFlow::Poll);
+                    self.redraw();
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.update_check = None;
+                }
+            }
         }
 
         let mut close_shield = false;
@@ -2249,6 +2352,81 @@ fn draw_settings_button(
 const SHIELD_CLOSE_X: c_int = SHIELD_W - 16 - SETTINGS_OK_W;
 const SHIELD_CLOSE_Y: c_int = SHIELD_H - 42;
 
+const UPDATE_W: c_int = 480;
+const UPDATE_H: c_int = 280;
+const UPDATE_CLOSE_X: c_int = UPDATE_W - 16 - SETTINGS_OK_W;
+const UPDATE_CLOSE_Y: c_int = UPDATE_H - 42;
+/// The Download button sits to the left of Close.
+const UPDATE_DOWNLOAD_W: c_int = 130;
+const UPDATE_DOWNLOAD_X: c_int = UPDATE_CLOSE_X - 12 - UPDATE_DOWNLOAD_W;
+const UPDATE_TEXT_Y: c_int = 100;
+const UPDATE_LINE_STEP: c_int = 24;
+/// Wrap width in characters for the update body.
+const UPDATE_WRAP_COLS: usize = 60;
+
+fn draw_update_content(
+    headline: &str,
+    paragraphs: &[String],
+    download_url: Option<&str>,
+    canvas: &mut Canvas,
+) {
+    canvas.set_fg(pal(COLOR_PAGE));
+    canvas.fill_rect(0, 0, UPDATE_W, UPDATE_H);
+    canvas.set_fg(pal(COLOR_BODY_TEXT));
+    canvas.text_baseline(28, 28, "Software Update");
+    canvas.set_fg(pal(COLOR_GO_BG));
+    canvas.text_baseline(28, 54, headline);
+    canvas.set_fg(pal(COLOR_PAGE_BORDER));
+    canvas.line(16, 68, UPDATE_W - 16, 68);
+
+    // Never draw into the Close button, however long the message is.
+    let last_y = UPDATE_CLOSE_Y - UPDATE_LINE_STEP;
+    let mut y = UPDATE_TEXT_Y;
+    canvas.set_fg(pal(COLOR_BODY_TEXT));
+    'outer: for paragraph in paragraphs {
+        for line in wrap_text(paragraph, UPDATE_WRAP_COLS) {
+            if y > last_y {
+                break 'outer;
+            }
+            canvas.text_baseline(28, y, &line);
+            y += UPDATE_LINE_STEP;
+        }
+        // A short gap between paragraphs.
+        y += UPDATE_LINE_STEP / 2;
+    }
+
+    if download_url.is_some() {
+        draw_settings_button(
+            canvas,
+            UPDATE_DOWNLOAD_X,
+            UPDATE_CLOSE_Y,
+            UPDATE_DOWNLOAD_W,
+            SETTINGS_OK_H,
+            "Download",
+            true,
+        );
+    }
+    draw_settings_button(
+        canvas,
+        UPDATE_CLOSE_X,
+        UPDATE_CLOSE_Y,
+        SETTINGS_OK_W,
+        SETTINGS_OK_H,
+        "Close",
+        false,
+    );
+}
+
+fn update_download_at(x: c_int, y: c_int) -> bool {
+    (UPDATE_DOWNLOAD_X..UPDATE_DOWNLOAD_X + UPDATE_DOWNLOAD_W).contains(&x)
+        && (UPDATE_CLOSE_Y..UPDATE_CLOSE_Y + SETTINGS_OK_H).contains(&y)
+}
+
+fn update_close_at(x: c_int, y: c_int) -> bool {
+    (UPDATE_CLOSE_X..UPDATE_CLOSE_X + SETTINGS_OK_W).contains(&x)
+        && (UPDATE_CLOSE_Y..UPDATE_CLOSE_Y + SETTINGS_OK_H).contains(&y)
+}
+
 fn draw_shield_content(state: ConnectionState, message: &str, canvas: &mut Canvas) {
     canvas.set_fg(pal(COLOR_PAGE));
     canvas.fill_rect(0, 0, SHIELD_W, SHIELD_H);
@@ -2514,5 +2692,51 @@ mod tests {
         let count = seen.len();
         seen.dedup();
         assert_eq!(seen.len(), count, "duplicate shortcut in the About window");
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    /// A long update message must not creep down into the Close button.
+    #[test]
+    fn update_body_stays_above_the_close_button() {
+        let last_allowed = UPDATE_CLOSE_Y - UPDATE_LINE_STEP;
+        let mut y = UPDATE_TEXT_Y;
+        let paragraphs = [
+            "Ghostab could not check for updates.".to_string(),
+            "the version file did not contain a valid version (\"<html>not a version</html>\")"
+                .repeat(4),
+        ];
+        'outer: for paragraph in &paragraphs {
+            for _ in wrap_text(paragraph, UPDATE_WRAP_COLS) {
+                if y > last_allowed {
+                    break 'outer;
+                }
+                y += UPDATE_LINE_STEP;
+            }
+            y += UPDATE_LINE_STEP / 2;
+        }
+        assert!(
+            y <= UPDATE_CLOSE_Y,
+            "update text reached y={y}, past the Close button at {UPDATE_CLOSE_Y}"
+        );
+    }
+
+    #[test]
+    fn update_download_button_sits_left_of_close() {
+        const { assert!(UPDATE_DOWNLOAD_X >= 0) };
+        const { assert!(UPDATE_DOWNLOAD_X + UPDATE_DOWNLOAD_W <= UPDATE_CLOSE_X) };
+        assert!(update_download_at(UPDATE_DOWNLOAD_X + 4, UPDATE_CLOSE_Y + 4));
+        assert!(!update_download_at(UPDATE_CLOSE_X + 4, UPDATE_CLOSE_Y + 4));
+    }
+
+    #[test]
+    fn update_close_button_is_inside_the_dialog() {
+        const { assert!(UPDATE_CLOSE_X >= 0 && UPDATE_CLOSE_X + SETTINGS_OK_W <= UPDATE_W) };
+        const { assert!(UPDATE_CLOSE_Y >= 0 && UPDATE_CLOSE_Y + SETTINGS_OK_H <= UPDATE_H) };
+        assert!(update_close_at(UPDATE_CLOSE_X + 4, UPDATE_CLOSE_Y + 4));
+        assert!(!update_close_at(4, UPDATE_CLOSE_Y + 4));
     }
 }

@@ -1,3 +1,12 @@
+ghostab (3.0.1-alpha) unstable; urgency=medium
+
+  * Built-in update checker: compares against aramcz.is-a.dev/ghostabver.txt
+    at launch and from Help, with a Download button that opens the release
+    page in your browser.
+  * Reworked About dialog with About, Shortcuts, and Credits tabs.
+
+ -- AramCZ <aramcz@protonmail.com>  Sun, 11 Oct 2026 00:00:00 +0000
+
 ghostab (3.0.0-alpha) unstable; urgency=medium
 
   * RightDao replaces Startpage as the default search engine.

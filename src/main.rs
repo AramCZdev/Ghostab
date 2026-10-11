@@ -261,7 +261,7 @@ const MENU_ITEMS: [&[&str]; 4] = [
     &["Reload", "Settings", "Quit"],
     &["Select All", "Copy", "Paste"],
     &["Scroll Top", "Scroll Up", "Scroll Down", "Scroll Bottom"],
-    &["About"],
+    &["About", "Check for Updates"],
 ];
 
 
@@ -1621,6 +1621,187 @@ fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Where the update check reads the published version from. The hosted file is
+/// the real source, but it is not live yet, so the local working copy in the
+/// website repo is preferred while it exists. Either way the file holds a bare
+/// version such as `1.1.1-alpha`.
+const UPDATE_VERSION_URL: &str = "https://aramcz.is-a.dev/ghostabver.txt";
+const UPDATE_VERSION_FILE: &str =
+    "/home/aramcz/Documents/GitHub/aramczdev.github.io/ghostabver.txt";
+
+/// Opened in the desktop browser when the user asks for the new version.
+const UPDATE_DOWNLOAD_URL: &str = "https://aramcz.is-a.dev/ghostab";
+
+/// A parsed `major.minor.patch[-pre]` version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Version {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    pre: Option<String>,
+}
+
+impl Version {
+    fn parse(text: &str) -> Option<Version> {
+        let text = text.trim();
+        let (core, pre) = match text.split_once('-') {
+            Some((core, pre)) => (core, Some(pre)),
+            None => (text, None),
+        };
+        if let Some(pre) = pre
+            && (pre.is_empty() || !pre.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '.'))
+        {
+            return None;
+        }
+        let mut parts = core.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Version {
+            major,
+            minor,
+            patch,
+            pre: pre.map(str::to_string),
+        })
+    }
+}
+
+/// Orders versions by release number, then by pre-release. A release outranks
+/// any pre-release of the same core (`1.0.0` > `1.0.0-beta`), and two
+/// pre-releases fall back to alphabetical order (`alpha` < `beta`).
+fn compare_versions(a: &Version, b: &Version) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    (a.major, a.minor, a.patch)
+        .cmp(&(b.major, b.minor, b.patch))
+        .then_with(|| match (&a.pre, &b.pre) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(a), Some(b)) => a.cmp(b),
+        })
+}
+
+fn version_is_newer(candidate: &Version, current: &Version) -> bool {
+    compare_versions(candidate, current) == std::cmp::Ordering::Greater
+}
+
+/// What the update check found, ready to show in the update popup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateOutcome {
+    UpToDate { current: String, latest: String },
+    Available { current: String, latest: String },
+    Failed(String),
+}
+
+impl UpdateOutcome {
+    /// The page to open for a new release, or `None` when there is nothing to
+    /// download.
+    fn download_url(&self) -> Option<&'static str> {
+        match self {
+            UpdateOutcome::Available { .. } => Some(UPDATE_DOWNLOAD_URL),
+            _ => None,
+        }
+    }
+
+    fn headline(&self) -> &'static str {
+        match self {
+            UpdateOutcome::UpToDate { .. } => "Ghostab is up to date",
+            UpdateOutcome::Available { .. } => "Update available",
+            UpdateOutcome::Failed(_) => "Update check failed",
+        }
+    }
+
+    /// The body text, as paragraphs. The dialog wraps each one itself.
+    fn paragraphs(&self) -> Vec<String> {
+        match self {
+            UpdateOutcome::UpToDate { current, latest } => vec![
+                format!("You are running Ghostab {current}, which is the newest version."),
+                format!("Published version: {latest}."),
+            ],
+            UpdateOutcome::Available { current, latest } => vec![
+                "A newer version of Ghostab is available.".to_string(),
+                format!("Installed: {current}. Latest: {latest}."),
+                "Download it from aramcz.is-a.dev/ghostab.".to_string(),
+            ],
+            UpdateOutcome::Failed(error) => vec![
+                "Ghostab could not check for updates.".to_string(),
+                error.clone(),
+            ],
+        }
+    }
+}
+
+/// Reads the raw version text, preferring the local copy and falling back to
+/// the hosted file once it is live.
+/// Reads the published version, preferring the hosted file and falling back to
+/// the local copy so the check still works while the site is not yet serving it.
+fn read_latest_version_text() -> Result<String, String> {
+    fetch_bytes(UPDATE_VERSION_URL)
+        .and_then(|bytes| validate_version_text(&String::from_utf8_lossy(&bytes)))
+        .or_else(|remote_error| {
+            fs::read_to_string(UPDATE_VERSION_FILE).map_err(|local_error| {
+                format!("{UPDATE_VERSION_URL}: {remote_error}; local copy: {local_error}")
+            })
+        })
+}
+
+/// Trims and validates a raw version file body.
+fn validate_version_text(raw: &str) -> Result<String, String> {
+    let latest = raw.trim().to_string();
+    if latest.is_empty() {
+        return Err("the version file is empty".to_string());
+    }
+    if Version::parse(&latest).is_none() {
+        return Err(format!(
+            "the version file did not contain a valid version ({latest:?})"
+        ));
+    }
+    Ok(latest)
+}
+
+fn check_latest_version() -> Result<String, String> {
+    validate_version_text(&read_latest_version_text()?)
+}
+
+/// Compares a published version against the running build.
+fn classify_update(latest: &str, current: &str) -> UpdateOutcome {
+    let newer = match (Version::parse(latest), Version::parse(current)) {
+        (Some(latest), Some(current)) => version_is_newer(&latest, &current),
+        _ => false,
+    };
+    if newer {
+        UpdateOutcome::Available {
+            current: current.to_string(),
+            latest: latest.to_string(),
+        }
+    } else {
+        UpdateOutcome::UpToDate {
+            current: current.to_string(),
+            latest: latest.to_string(),
+        }
+    }
+}
+
+fn update_outcome() -> UpdateOutcome {
+    match check_latest_version() {
+        Ok(latest) => classify_update(&latest, env!("CARGO_PKG_VERSION")),
+        Err(error) => UpdateOutcome::Failed(error),
+    }
+}
+
+/// Runs the update check on a worker thread so the network fetch never blocks
+/// the event loop. The caller polls the returned receiver in `about_to_wait`.
+fn spawn_update_check() -> std::sync::mpsc::Receiver<UpdateOutcome> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(update_outcome());
+    });
+    receiver
+}
+
 fn scale_dims(source_width: u32, source_height: u32, max_width: u32) -> (u32, u32) {
     if source_width <= max_width {
         (source_width.max(1), source_height.max(1))
@@ -1845,6 +2026,7 @@ enum MenuAction {
     ScrollDown,
     ScrollBottom,
     About,
+    CheckUpdates,
     None,
 }
 
@@ -1897,6 +2079,7 @@ fn menu_item_action(menu: usize, item: usize) -> MenuAction {
         (2, 2) => MenuAction::ScrollDown,
         (2, 3) => MenuAction::ScrollBottom,
         (3, 0) => MenuAction::About,
+        (3, 1) => MenuAction::CheckUpdates,
         _ => MenuAction::None,
     }
 }
@@ -2893,5 +3076,147 @@ mod tests {
             "<html><body><img src=\"http://localhost:8090/x.png\"></body></html>".to_string();
         app.relayout();
         assert!(app.images.failed.contains("http://localhost:8090/x.png"));
+    }
+
+    #[test]
+    fn version_parsing_accepts_releases_and_prereleases() {
+        assert_eq!(
+            Version::parse("3.0.0-alpha"),
+            Some(Version {
+                major: 3,
+                minor: 0,
+                patch: 0,
+                pre: Some("alpha".to_string()),
+            })
+        );
+        assert_eq!(
+            Version::parse("1.1.1"),
+            Some(Version {
+                major: 1,
+                minor: 1,
+                patch: 1,
+                pre: None,
+            })
+        );
+        // Surrounding whitespace and newlines are tolerated.
+        assert!(Version::parse("  1.1.1-alpha\n").is_some());
+    }
+
+    #[test]
+    fn version_parsing_rejects_junk() {
+        for bad in [
+            "",
+            "1.1",
+            "1.1.1.1",
+            "one.two.three",
+            "1.1.1-",
+            "1.1.1-alpha!",
+            "1.1.x",
+            "v1.1.1",
+        ] {
+            assert!(Version::parse(bad).is_none(), "accepted junk version {bad:?}");
+        }
+    }
+
+    #[test]
+    fn newer_versions_are_detected() {
+        for (candidate, current) in [
+            ("1.1.2-alpha", "1.1.1-alpha"),
+            ("1.2.0", "1.1.9"),
+            ("2.0.0", "1.9.9"),
+            ("1.0.0", "1.0.0-beta"),
+            ("1.0.0-beta", "1.0.0-alpha"),
+        ] {
+            let candidate = Version::parse(candidate).unwrap();
+            let current = Version::parse(current).unwrap();
+            assert!(
+                version_is_newer(&candidate, &current),
+                "{candidate:?} should be newer than {current:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn equal_and_older_versions_are_not_newer() {
+        for (candidate, current) in [
+            ("3.0.0-alpha", "3.0.0-alpha"),
+            ("1.1.1-alpha", "3.0.0-alpha"),
+            ("1.0.0-alpha", "1.0.0"),
+        ] {
+            let candidate = Version::parse(candidate).unwrap();
+            let current = Version::parse(current).unwrap();
+            assert!(
+                !version_is_newer(&candidate, &current),
+                "{candidate:?} should not be newer than {current:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_update_reports_newer_and_older_publishes() {
+        match classify_update("3.1.0-alpha", "3.0.0-alpha") {
+            UpdateOutcome::Available { current, latest } => {
+                assert_eq!(current, "3.0.0-alpha");
+                assert_eq!(latest, "3.1.0-alpha");
+            }
+            other => panic!("expected an available update, got {other:?}"),
+        }
+        match classify_update("1.1.1-alpha", "3.0.0-alpha") {
+            UpdateOutcome::UpToDate { .. } => {}
+            other => panic!("expected up to date, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_messages_name_the_versions() {
+        let outcome = UpdateOutcome::Available {
+            current: "3.0.0-alpha".to_string(),
+            latest: "3.1.0-alpha".to_string(),
+        };
+        let body = outcome.paragraphs().join(" ");
+        assert!(body.contains("3.0.0-alpha"), "missing current version: {body}");
+        assert!(body.contains("3.1.0-alpha"), "missing latest version: {body}");
+        assert_eq!(outcome.headline(), "Update available");
+
+        let failed = UpdateOutcome::Failed("offline".to_string());
+        assert_eq!(failed.headline(), "Update check failed");
+        assert!(failed.paragraphs().join(" ").contains("offline"));
+    }
+
+    #[test]
+    fn only_an_available_update_offers_a_download() {
+        let available = UpdateOutcome::Available {
+            current: "3.0.0-alpha".to_string(),
+            latest: "3.0.1-alpha".to_string(),
+        };
+        assert_eq!(available.download_url(), Some(UPDATE_DOWNLOAD_URL));
+
+        let up_to_date = UpdateOutcome::UpToDate {
+            current: "3.0.0-alpha".to_string(),
+            latest: "3.0.0-alpha".to_string(),
+        };
+        assert_eq!(up_to_date.download_url(), None);
+        assert_eq!(UpdateOutcome::Failed("offline".to_string()).download_url(), None);
+    }
+
+    #[test]
+    fn version_text_validation_rejects_garbage() {
+        assert_eq!(validate_version_text(" 1.1.1-alpha\n").unwrap(), "1.1.1-alpha");
+        assert!(validate_version_text("").is_err());
+        assert!(validate_version_text("not a version").is_err());
+        assert!(validate_version_text("<html>hello</html>").is_err());
+    }
+
+    /// Guards the published file this machine reads from: a typo there would
+    /// silently turn every update check into a failure.
+    #[test]
+    fn the_local_version_file_parses_when_present() {
+        if let Ok(text) = fs::read_to_string(UPDATE_VERSION_FILE) {
+            assert_eq!(
+                validate_version_text(&text).unwrap(),
+                text.trim(),
+                "the local version file did not validate"
+            );
+        }
     }
 }
